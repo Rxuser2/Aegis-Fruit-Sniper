@@ -185,9 +185,12 @@ local Config = {
 -- ============================================================================
 local CONFIG_FOLDER = "AegisFruitSniper"
 local CONFIG_FILE   = "AegisFruitSniper/config.json"
+local VISITED_FILE  = "AegisFruitSniper/visited_servers.json"
+local POOL_FILE     = "AegisFruitSniper/server_pool.json"
 local SCRIPT_FILE   = "AegisFruitSniper/GreatestFruitSniper.luau"
 local IsInitializingUI = true
 local LastConfigSave = 0
+local ScriptStartTime = os.clock()
 
 local function ensureConfigFolder()
     pcall(function()
@@ -1181,10 +1184,58 @@ local function rollCousinGacha()
 end
 
 -- ============================================================================
--- 7. CRASH-SAFE SMART SERVER HOPPER
+-- 7. CRASH-SAFE SMART SERVER HOPPER (Anti-Same-Server Blacklist + Cached Pool)
 -- ============================================================================
 local IsHopping = false
 local EspObjects = {} -- [instance] = { Text = Drawing, Line = Drawing }
+local VisitedServers = {} -- [jobId] = os.time()
+local CachedServerPool = {} -- array of unvisited jobIds
+local VISITED_TTL = 2700 -- 45 minutes blacklist per server
+
+local function loadServerHopCache()
+    local nowUnix = os.time()
+    pcall(function()
+        if isfile and readfile and isfile(VISITED_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(VISITED_FILE))
+            if type(decoded) == "table" then
+                for jid, ts in pairs(decoded) do
+                    if type(jid) == "string" and tonumber(ts) and (nowUnix - tonumber(ts)) < VISITED_TTL then
+                        VisitedServers[jid] = tonumber(ts)
+                    end
+                end
+            end
+        end
+    end)
+    -- Always blacklist the current server JobId immediately
+    if game.JobId and game.JobId ~= "" then
+        VisitedServers[tostring(game.JobId)] = nowUnix
+    end
+    pcall(function()
+        if isfile and readfile and isfile(POOL_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(POOL_FILE))
+            if type(decoded) == "table" then
+                for _, jid in ipairs(decoded) do
+                    if type(jid) == "string" and jid ~= "" and not VisitedServers[jid] then
+                        table.insert(CachedServerPool, jid)
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function saveServerHopCache()
+    pcall(function()
+        if writefile then
+            ensureConfigFolder()
+            writefile(VISITED_FILE, HttpService:JSONEncode(VisitedServers))
+            writefile(POOL_FILE, HttpService:JSONEncode(CachedServerPool))
+        end
+    end)
+end
+
+loadServerHopCache()
+saveServerHopCache()
 
 local function removeEspForInstance(inst)
     local obj = EspObjects[inst]
@@ -1201,60 +1252,63 @@ local function clearAllEsp()
     end
 end
 
-local function hopToNewServer()
-    if IsHopping then return end
-    IsHopping = true
-    stopFlight()
-    clearAllEsp()
-    saveConfig(true)
-    armTeleportAutoExecute()
+local function shuffleArray(arr)
+    for i = #arr, 2, -1 do
+        local j = math.random(1, i)
+        arr[i], arr[j] = arr[j], arr[i]
+    end
+end
 
-    if Config.NotifyOnHop then
-        sendDiscordWebhook(
-            "🔄 Server Hopping...",
-            "No target fruits remaining in current server. Hopping to a new Blox Fruits server...",
-            0x3B82F6,
-            {},
-            DEFAULT_FRUIT_ICON
-        )
+local function fetchFreshServerIds(placeId)
+    local currentJobId = tostring(game.JobId)
+    local nowUnix = os.time()
+    local seen = {}
+    for _, existingId in ipairs(CachedServerPool) do
+        seen[existingId] = true
     end
 
-    task.spawn(function()
-        -- Wait 2 frames so physics & drawings settle before TeleportService transitions
-        task.wait(0.1)
-        local placeId = game.PlaceId
-        local currentJobId = game.JobId
-        local cursor = ""
+    local endpoints = {
+        string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
+        string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
+        string.format("https://games.roproxy.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
+    }
 
-        for page = 1, 4 do
-            local url = string.format(
-                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s",
-                placeId,
-                cursor ~= "" and ("&cursor=" .. cursor) or ""
-            )
+    -- Randomize starting endpoint order so we don't always hit the same page
+    if math.random(1, 2) == 2 then
+        endpoints[1], endpoints[2] = endpoints[2], endpoints[1]
+    end
+
+    for _, baseUrl in ipairs(endpoints) do
+        local cursor = ""
+        for page = 1, 2 do
+            local url = baseUrl .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
             local ok, resp = pcall(function()
                 return HttpService:JSONDecode(game:HttpGet(url))
             end)
             if ok and type(resp) == "table" and type(resp.data) == "table" then
-                local candidates = {}
+                local addedCount = 0
                 for _, srv in ipairs(resp.data) do
-                    if type(srv) == "table"
-                        and srv.id ~= currentJobId
-                        and tonumber(srv.playing)
-                        and tonumber(srv.maxPlayers)
-                        and srv.playing < (srv.maxPlayers - 2)
-                        and srv.playing >= 2 then
-                        table.insert(candidates, srv.id)
+                    if type(srv) == "table" and type(srv.id) == "string" then
+                        local jid = srv.id
+                        local playing = tonumber(srv.playing) or 0
+                        local maxP = tonumber(srv.maxPlayers) or 12
+                        local visitedTs = VisitedServers[jid]
+                        local isVisited = visitedTs and ((nowUnix - visitedTs) < VISITED_TTL)
+                        if jid ~= currentJobId
+                            and not isVisited
+                            and not seen[jid]
+                            and playing >= 3
+                            and playing <= (maxP - 2) then
+                            seen[jid] = true
+                            table.insert(CachedServerPool, jid)
+                            addedCount = addedCount + 1
+                        end
                     end
                 end
-                if #candidates > 0 then
-                    local chosen = candidates[math.random(1, #candidates)]
-                    pcall(function()
-                        TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
-                    end)
-                    task.wait(3.5)
+                if addedCount >= 15 then
+                    break
                 end
-                if resp.nextPageCursor then
+                if type(resp.nextPageCursor) == "string" and resp.nextPageCursor ~= "" then
                     cursor = resp.nextPageCursor
                 else
                     break
@@ -1263,11 +1317,93 @@ local function hopToNewServer()
                 break
             end
         end
+        if #CachedServerPool >= 20 then
+            break
+        end
+    end
 
-        pcall(function()
-            TeleportService:Teleport(placeId, LocalPlayer)
-        end)
-        task.wait(5)
+    shuffleArray(CachedServerPool)
+    saveServerHopCache()
+end
+
+local TeleportFailedSignal = false
+addConnection(TeleportService.TeleportInitFailed, function(_, teleportResult, errorMessage)
+    TeleportFailedSignal = true
+end)
+
+local function hopToNewServer()
+    if IsHopping then return end
+    IsHopping = true
+    stopFlight()
+    clearAllEsp()
+    VisitedServers[tostring(game.JobId)] = os.time()
+    saveConfig(true)
+    saveServerHopCache()
+    armTeleportAutoExecute()
+
+    if Config.NotifyOnHop then
+        sendDiscordWebhook(
+            "🔄 Server Hopping...",
+            "No target fruits remaining in current server. Hopping to a guaranteed unvisited Blox Fruits server...",
+            0x3B82F6,
+            {},
+            DEFAULT_FRUIT_ICON
+        )
+    end
+
+    task.spawn(function()
+        task.wait(0.1)
+        local placeId = game.PlaceId
+        local currentJobId = tostring(game.JobId)
+
+        -- Filter out any already-visited servers from CachedServerPool
+        local cleanPool = {}
+        local nowUnix = os.time()
+        for _, jid in ipairs(CachedServerPool) do
+            local vTs = VisitedServers[jid]
+            if jid ~= currentJobId and (not vTs or (nowUnix - vTs) >= VISITED_TTL) then
+                table.insert(cleanPool, jid)
+            end
+        end
+        CachedServerPool = cleanPool
+
+        -- Fetch new servers if our cached pool is low
+        if #CachedServerPool < 10 then
+            fetchFreshServerIds(placeId)
+        end
+
+        -- Try up to 15 distinct unvisited JobIds from the pool
+        for attempt = 1, 15 do
+            if not isScriptAlive() then break end
+            if #CachedServerPool == 0 then
+                fetchFreshServerIds(placeId)
+                if #CachedServerPool == 0 then
+                    task.wait(2)
+                    fetchFreshServerIds(placeId)
+                end
+            end
+
+            local chosen = table.remove(CachedServerPool, 1)
+            if chosen and chosen ~= currentJobId and not VisitedServers[chosen] then
+                VisitedServers[chosen] = os.time()
+                saveServerHopCache()
+                TeleportFailedSignal = false
+
+                pcall(function()
+                    TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
+                end)
+
+                -- Wait up to 3.5s, but abort early if TeleportInitFailed fires
+                local waitStart = os.clock()
+                while (os.clock() - waitStart) < 3.5 do
+                    if TeleportFailedSignal then
+                        break
+                    end
+                    task.wait(0.15)
+                end
+            end
+        end
+
         IsHopping = false
     end)
 end
@@ -1886,17 +2022,33 @@ TabFlight:Slider({
 })
 
 TabFlight:Button({
-    Title = "🌐 Server Hop Immediately",
-    Desc = "Finds a public server with open slots and teleports safely right now.",
+    Title = "🌐 Server Hop Immediately (Guaranteed New Server)",
+    Desc = "Picks an unvisited server from the cached pool / multi-endpoint API and teleports safely.",
     Icon = "external-link",
     Callback = function()
         WindUI:Notify({
-            Title = "Server Hopping",
-            Content = "Searching for a new Blox Fruits server...",
+            Title = "Smart Server Hopping",
+            Content = string.format("Hopping to an unvisited server (Pool: %d cached)...", #CachedServerPool),
             Duration = 3,
             Icon = "globe",
         })
         hopToNewServer()
+    end,
+})
+
+TabFlight:Button({
+    Title = "🗑️ Reset Visited Server Blacklist",
+    Desc = "Clears visited_servers.json history if you want to allow revisiting older servers.",
+    Icon = "trash-2",
+    Callback = function()
+        VisitedServers = { [tostring(game.JobId)] = os.time() }
+        saveServerHopCache()
+        WindUI:Notify({
+            Title = "Visited Servers Cleared",
+            Content = "Reset server history (current server remains excluded).",
+            Duration = 3,
+            Icon = "check",
+        })
     end,
 })
 
@@ -2086,15 +2238,6 @@ task.spawn(function()
                     stopFlight()
                 end
                 CurrentSnipeTarget = nil
-
-                if Config.AutoServerHop and not IsHopping then
-                    if not EmptyMapSince then
-                        EmptyMapSince = now
-                    elseif (now - EmptyMapSince) >= Config.ServerHopDelay then
-                        EmptyMapSince = now + 999
-                        hopToNewServer()
-                    end
-                end
             end
         elseif CurrentSnipeTarget then
             if not CurrentSnipeTarget.Instance or not CurrentSnipeTarget.Instance.Parent or not CurrentSnipeTarget.Handle or not CurrentSnipeTarget.Handle.Parent then
@@ -2103,6 +2246,18 @@ task.spawn(function()
             else
                 setFlightTarget(CurrentSnipeTarget.Handle.Position, CurrentSnipeTarget.Name, CurrentSnipeTarget.Handle)
             end
+        end
+
+        -- Smart Server Hop check when no target fruits exist on map (waits 5s after join for streaming)
+        if Config.AutoServerHop and not IsHopping and not FlightState.Active and targetEntry == nil and (now - ScriptStartTime) >= 5 and getCharacter() ~= nil then
+            if not EmptyMapSince then
+                EmptyMapSince = now
+            elseif (now - EmptyMapSince) >= Config.ServerHopDelay then
+                EmptyMapSince = now + 999
+                hopToNewServer()
+            end
+        elseif targetEntry ~= nil then
+            EmptyMapSince = nil
         end
 
         -- 4. Periodic Dealer Check & Auto Gacha
