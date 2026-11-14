@@ -255,15 +255,20 @@ local function armTeleportAutoExecute()
             local payload = string.format([[
                 repeat task.wait(0.25) until game:IsLoaded() and game:GetService("Players").LocalPlayer
                 task.wait(1.2)
+                if isfile and readfile and isfile(%q) then
+                    local raw = readfile(%q)
+                    if type(raw) == "string" and #raw > 500 then
+                        loadstring(raw)()
+                        return
+                    end
+                end
                 local ok, src = pcall(function()
-                    return game:HttpGet(%q)
+                    return game:HttpGet(%q .. "?cb=" .. tostring(os.time()))
                 end)
                 if ok and type(src) == "string" and #src > 100 then
                     loadstring(src)()
-                elseif isfile and readfile and isfile(%q) then
-                    loadstring(readfile(%q))()
                 end
-            ]], GITHUB_RAW_URL, SCRIPT_FILE, SCRIPT_FILE)
+            ]], SCRIPT_FILE, SCRIPT_FILE, GITHUB_RAW_URL)
             qot(payload)
         end
     end)
@@ -1267,58 +1272,89 @@ local function fetchFreshServerIds(placeId)
         seen[existingId] = true
     end
 
-    local endpoints = {
-        string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
-        string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
-        string.format("https://games.roproxy.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
-    }
-
-    -- Randomize starting endpoint order so we don't always hit the same page
-    if math.random(1, 2) == 2 then
-        endpoints[1], endpoints[2] = endpoints[2], endpoints[1]
-    end
-
-    for _, baseUrl in ipairs(endpoints) do
-        local cursor = ""
-        for page = 1, 2 do
-            local url = baseUrl .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
-            local ok, resp = pcall(function()
-                return HttpService:JSONDecode(game:HttpGet(url))
-            end)
-            if ok and type(resp) == "table" and type(resp.data) == "table" then
-                local addedCount = 0
-                for _, srv in ipairs(resp.data) do
-                    if type(srv) == "table" and type(srv.id) == "string" then
-                        local jid = srv.id
-                        local playing = tonumber(srv.playing) or 0
-                        local maxP = tonumber(srv.maxPlayers) or 12
-                        local visitedTs = VisitedServers[jid]
-                        local isVisited = visitedTs and ((nowUnix - visitedTs) < VISITED_TTL)
-                        if jid ~= currentJobId
-                            and not isVisited
-                            and not seen[jid]
-                            and playing >= 3
-                            and playing <= (maxP - 2) then
-                            seen[jid] = true
-                            table.insert(CachedServerPool, jid)
-                            addedCount = addedCount + 1
+    -- 1. Try Blox Fruits Native __ServerBrowser Remote FIRST (Never HTTP 429 rate-limited!)
+    pcall(function()
+        local sb = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+        if sb then
+            local pagesToTry = { math.random(2, 6), math.random(7, 12), 1 }
+            for _, pg in ipairs(pagesToTry) do
+                local ok, list = pcall(function()
+                    return sb:InvokeServer(pg)
+                end)
+                if ok and type(list) == "table" then
+                    for jobId, info in pairs(list) do
+                        if type(jobId) == "string" and #jobId > 10 and jobId ~= currentJobId and not seen[jobId] then
+                            local count = (type(info) == "table" and tonumber(info.Count)) or 5
+                            local visitedTs = VisitedServers[jobId]
+                            local isVisited = visitedTs and ((nowUnix - visitedTs) < VISITED_TTL)
+                            if not isVisited and count >= 2 and count <= 10 then
+                                seen[jobId] = true
+                                table.insert(CachedServerPool, jobId)
+                            end
                         end
                     end
                 end
-                if addedCount >= 15 then
+                if #CachedServerPool >= 25 then
                     break
                 end
-                if type(resp.nextPageCursor) == "string" and resp.nextPageCursor ~= "" then
-                    cursor = resp.nextPageCursor
+            end
+        end
+    end)
+
+    -- 2. Also query Roblox / RoProxy Public Servers API if pool still needs more servers
+    if #CachedServerPool < 15 then
+        local endpoints = {
+            string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
+            string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
+            string.format("https://games.roproxy.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
+        }
+
+        if math.random(1, 2) == 2 then
+            endpoints[1], endpoints[2] = endpoints[2], endpoints[1]
+        end
+
+        for _, baseUrl in ipairs(endpoints) do
+            local cursor = ""
+            for page = 1, 2 do
+                local url = baseUrl .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
+                local ok, resp = pcall(function()
+                    return HttpService:JSONDecode(game:HttpGet(url))
+                end)
+                if ok and type(resp) == "table" and type(resp.data) == "table" then
+                    local addedCount = 0
+                    for _, srv in ipairs(resp.data) do
+                        if type(srv) == "table" and type(srv.id) == "string" then
+                            local jid = srv.id
+                            local playing = tonumber(srv.playing) or 0
+                            local maxP = tonumber(srv.maxPlayers) or 12
+                            local visitedTs = VisitedServers[jid]
+                            local isVisited = visitedTs and ((nowUnix - visitedTs) < VISITED_TTL)
+                            if jid ~= currentJobId
+                                and not isVisited
+                                and not seen[jid]
+                                and playing >= 2
+                                and playing <= (maxP - 2) then
+                                seen[jid] = true
+                                table.insert(CachedServerPool, jid)
+                                addedCount = addedCount + 1
+                            end
+                        end
+                    end
+                    if addedCount >= 15 then
+                        break
+                    end
+                    if type(resp.nextPageCursor) == "string" and resp.nextPageCursor ~= "" then
+                        cursor = resp.nextPageCursor
+                    else
+                        break
+                    end
                 else
                     break
                 end
-            else
+            end
+            if #CachedServerPool >= 20 then
                 break
             end
-        end
-        if #CachedServerPool >= 20 then
-            break
         end
     end
 
@@ -1389,6 +1425,17 @@ local function hopToNewServer()
                 saveServerHopCache()
                 TeleportFailedSignal = false
 
+                -- Method A: Blox Fruits Native __ServerBrowser teleport
+                pcall(function()
+                    local sb = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+                    if sb then
+                        task.spawn(function()
+                            pcall(function() sb:InvokeServer("teleport", chosen) end)
+                        end)
+                    end
+                end)
+
+                -- Method B: Direct TeleportService:TeleportToPlaceInstance
                 pcall(function()
                     TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
                 end)
