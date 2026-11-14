@@ -95,6 +95,7 @@ local Config = {
     AutoSnipeMap = false,
     OnlySnipeFiltered = false,
     SnipeNaturalSpawns = true,
+    SnipeUnknownNatural = true, -- Snipe & auto-learn natural spawns whose MeshId hasn't been fingerprinted yet
     SnipeDroppedTools = true,
     AutoStoreFruits = true,
     AutoJoinTeam = "Marines", -- "Pirates", "Marines", "Disabled"
@@ -110,9 +111,10 @@ local Config = {
     DealerCheckInterval = 20,
     AutoRollGacha = false,
 
-    -- Server Hop
+    -- Server Hop (Turbo Mode)
     AutoServerHop = false,
-    ServerHopDelay = 15,
+    TurboFastHop = true,      -- Instant 1.5s scan & hop using pre-warmed server pool
+    ServerHopDelay = 2,       -- Default 2s wait delay
 
     -- Visuals (ESP & Custom HUD)
     FruitESP = true,
@@ -183,14 +185,15 @@ local Config = {
 -- ============================================================================
 -- 1B. AUTO-CONFIG PERSISTENCE & TELEPORT AUTO-EXECUTE ENGINE
 -- ============================================================================
-local CONFIG_FOLDER = "AegisFruitSniper"
-local CONFIG_FILE   = "AegisFruitSniper/config.json"
-local VISITED_FILE  = "AegisFruitSniper/visited_servers.json"
-local POOL_FILE     = "AegisFruitSniper/server_pool.json"
-local SCRIPT_FILE   = "AegisFruitSniper/GreatestFruitSniper.luau"
-local IsInitializingUI = true
-local LastConfigSave = 0
-local ScriptStartTime = os.clock()
+local CONFIG_FOLDER      = "AegisFruitSniper"
+local CONFIG_FILE        = "AegisFruitSniper/config.json"
+local VISITED_FILE       = "AegisFruitSniper/visited_servers.json"
+local POOL_FILE          = "AegisFruitSniper/server_pool.json"
+local FINGERPRINTS_FILE  = "AegisFruitSniper/fruit_fingerprints.json"
+local SCRIPT_FILE        = "AegisFruitSniper/GreatestFruitSniper.luau"
+local IsInitializingUI   = true
+local LastConfigSave     = 0
+local ScriptStartTime    = os.clock()
 
 local function ensureConfigFolder()
     pcall(function()
@@ -253,8 +256,8 @@ local function armTeleportAutoExecute()
         if qot and not genv.__AegisTeleportQueued then
             genv.__AegisTeleportQueued = true
             local payload = string.format([[
-                repeat task.wait(0.25) until game:IsLoaded() and game:GetService("Players").LocalPlayer
-                task.wait(1.2)
+                repeat task.wait(0.05) until game:IsLoaded() and game:GetService("Players").LocalPlayer
+                task.wait(0.15)
                 if isfile and readfile and isfile(%q) then
                     local raw = readfile(%q)
                     if type(raw) == "string" and #raw > 500 then
@@ -281,8 +284,20 @@ addConnection(LocalPlayer.OnTeleport, function()
     armTeleportAutoExecute()
 end)
 
+-- Instant Auto-Join Team at startup before UI even builds (shaves 1.5-2s off server hop scan!)
+if not LocalPlayer.Character and Config.AutoJoinTeam ~= "Disabled" then
+    task.spawn(function()
+        pcall(function()
+            local commF = ReplicatedStorage:WaitForChild("Remotes", 3) and ReplicatedStorage.Remotes:WaitForChild("CommF_", 3)
+            if commF and not LocalPlayer.Character then
+                commF:InvokeServer("SetTeam", Config.AutoJoinTeam)
+            end
+        end)
+    end)
+end
+
 -- ============================================================================
--- 2. BLOX FRUITS DATABASE, RARITY METADATA & OFFICIAL WIKI ICONS
+-- 2. BLOX FRUITS DATABASE, RARITY METADATA & PRE-PICKUP 'Fruit ' IDENTIFIER
 -- ============================================================================
 local WIKI_BASE = "https://static.wikia.nocookie.net/roblox-blox-piece/images/"
 local DEFAULT_FRUIT_ICON = WIKI_BASE .. "6/65/Kitsune_Fruit.png"
@@ -296,6 +311,7 @@ local FruitCatalog = {
     { Id = "Yeti-Yeti", Display = "Yeti", Rarity = "Mythical", Price = 5000000, Icon = WIKI_BASE .. "2/2f/Yeti_Fruit.png" },
     { Id = "Fiend (Yeti)-Fiend (Yeti)", Display = "Fiend Yeti", Rarity = "Mythical", Price = 5000000, Icon = WIKI_BASE .. "2/2f/Yeti_Fruit.png" },
     { Id = "Tiger-Tiger", Display = "Tiger (Leopard)", Rarity = "Mythical", Price = 5000000, Icon = WIKI_BASE .. "1/14/Tiger_Fruit.png" },
+    { Id = "Werewolf (Tiger)-Werewolf (Tiger)", Display = "Werewolf Tiger", Rarity = "Mythical", Price = 5000000, Icon = WIKI_BASE .. "1/14/Tiger_Fruit.png" },
     { Id = "Leopard-Leopard", Display = "Leopard", Rarity = "Mythical", Price = 5000000, Icon = WIKI_BASE .. "a/a3/Leopard_Fruit.png" },
     { Id = "Gas-Gas", Display = "Gas", Rarity = "Mythical", Price = 3200000, Icon = WIKI_BASE .. "e/ed/Gas_Fruit.png" },
     { Id = "Spirit-Spirit", Display = "Spirit", Rarity = "Mythical", Price = 3400000, Icon = WIKI_BASE .. "6/66/Spirit_Fruit.png" },
@@ -346,12 +362,18 @@ local FruitCatalog = {
 
 local FruitMetaById = {}
 local FruitMetaByShort = {}
+local FruitMetaByItemId = {}
 local AllFruitIds = {}
+local AllFruitSeen = {}
+
 for _, item in ipairs(FruitCatalog) do
     FruitMetaById[item.Id] = item
     local shortName = item.Id:match("^(.-)%-") or item.Id
     FruitMetaByShort[shortName:lower()] = item
-    table.insert(AllFruitIds, item.Id)
+    if not AllFruitSeen[item.Id] then
+        AllFruitSeen[item.Id] = true
+        table.insert(AllFruitIds, item.Id)
+    end
 end
 
 -- Dynamic Wiki Icon Resolver for any future update fruits
@@ -372,6 +394,254 @@ local function fetchDynamicWikiIconAsync(shortName, metaTable)
             if matchUrl then
                 matchUrl = matchUrl:gsub("\\/", "/")
                 metaTable.Icon = matchUrl
+            end
+        end
+    end)
+end
+
+-- Auto-Enrich Database from ReplicatedStorage.ItemConfig (Captures all 81+ PhysicalMoveset fruits & ItemIds)
+pcall(function()
+    local icMod = ReplicatedStorage:FindFirstChild("ItemConfig")
+    if icMod then
+        local ic = require(icMod)
+        if type(ic) == "table" and ic.Query and ic.Query.select then
+            local items = ic.Query.select({ Index = { IdType = "PhysicalMoveset" } })
+            if type(items) == "table" then
+                for _, item in pairs(items) do
+                    local idx = item.Index
+                    local disp = item.Display
+                    local qual = item.Quality
+                    if idx and idx.StorageKey then
+                        local key = tostring(idx.StorageKey)
+                        local itemId = tonumber(idx.ItemId)
+                        local dName = (disp and disp.Name) or (key:match("^(.-)%-") or key)
+                        local rar = (qual and qual.Rarity) or "Mythical"
+                        local price = tonumber(qual and qual.MoneyPrice) or 0
+                        local existing = FruitMetaById[key] or FruitMetaByShort[dName:lower()]
+                        if existing then
+                            if itemId then
+                                existing.ItemId = itemId
+                                FruitMetaByItemId[itemId] = existing
+                            end
+                            FruitMetaById[key] = existing
+                        else
+                            local baseWord = dName:match("([%a%-]+)$") or dName
+                            local baseMeta = FruitMetaByShort[baseWord:lower()]
+                            local newMeta = {
+                                Id = key,
+                                ItemId = itemId,
+                                Display = dName,
+                                Rarity = rar,
+                                Price = price,
+                                Icon = (baseMeta and baseMeta.Icon) or DEFAULT_FRUIT_ICON,
+                            }
+                            FruitMetaById[key] = newMeta
+                            FruitMetaByShort[dName:lower()] = newMeta
+                            if itemId then
+                                FruitMetaByItemId[itemId] = newMeta
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Pre-Pickup Natural Spawn ("Fruit ") Collision-Proof Fingerprint Database
+-- Stores SIG (composite mesh+color+anim), MESH@RGB, MAP@RGB, ANIM, and RAW keys with __SHARED__ guard
+local FruitAssetMap = {
+    -- Verified Live Asset Fingerprints (Sand Fruit)
+    ["ANIM:rbxassetid://15123673019"]             = "Sand-Sand",
+    ["MESH:rbxassetid://15111517529@248,217,109"]   = "Sand-Sand",
+    ["RAW:rbxassetid://15111517529"]                = "Sand-Sand",
+    ["SIG:rbxassetid://15111517528@40,127,71@|rbxassetid://15111517529@248,217,109@|rbxassetid://15111517558@163,162,165@::rbxassetid://15123673019"] = "Sand-Sand",
+    ["ANIM:rbxassetid://121982453080224"]           = "Control-Control",
+}
+local LearnedFruitIds = {}
+local LearnedFruitCount = 0
+local LastFingerprintSave = 0
+local PendingNaturalLearn = nil
+
+local function recountLearnedFruits()
+    table.clear(LearnedFruitIds)
+    local cnt = 0
+    for _, v in pairs(FruitAssetMap) do
+        if type(v) == "string" and v ~= "" and v ~= "__SHARED__" and not LearnedFruitIds[v] then
+            LearnedFruitIds[v] = true
+            cnt = cnt + 1
+        end
+    end
+    LearnedFruitCount = cnt
+end
+
+local function loadFruitFingerprints()
+    pcall(function()
+        if isfile and readfile and isfile(FINGERPRINTS_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(FINGERPRINTS_FILE))
+            if type(decoded) == "table" then
+                for assetKey, fruitId in pairs(decoded) do
+                    if type(assetKey) == "string" and type(fruitId) == "string" then
+                        if fruitId == "__SHARED__" or FruitMetaById[fruitId] then
+                            FruitAssetMap[assetKey] = fruitId
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    recountLearnedFruits()
+end
+
+local function saveFruitFingerprints(forceImmediate)
+    recountLearnedFruits()
+    local now = os.clock()
+    if not forceImmediate and (now - LastFingerprintSave) < 0.5 then return end
+    LastFingerprintSave = now
+    pcall(function()
+        if writefile then
+            ensureConfigFolder()
+            writefile(FINGERPRINTS_FILE, HttpService:JSONEncode(FruitAssetMap))
+        end
+    end)
+end
+
+loadFruitFingerprints()
+
+local function colorToRgbKey(col)
+    if typeof(col) ~= "Color3" then return "0,0,0" end
+    return string.format("%d,%d,%d", math.floor(col.R * 255 + 0.5), math.floor(col.G * 255 + 0.5), math.floor(col.B * 255 + 0.5))
+end
+
+local function extractInstanceAssetFingerprints(instance)
+    local keys = {}
+    if not instance then return keys end
+
+    local meshSigParts = {}
+    local animSigParts = {}
+    local coloredMeshKeys = {}
+    local mapKeys = {}
+    local animKeys = {}
+    local rawMeshKeys = {}
+
+    local root = instance:FindFirstChild("Fruit")
+    if not root or (not root:FindFirstChildWhichIsA("MeshPart", true) and not root:FindFirstChildWhichIsA("Animation", true)) then
+        root = instance
+    end
+
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("MeshPart") then
+            local mid = type(d.MeshId) == "string" and d.MeshId or ""
+            local tid = type(d.TextureID) == "string" and d.TextureID or ""
+            local rgb = colorToRgbKey(d.Color)
+            local sa = d:FindFirstChildOfClass("SurfaceAppearance")
+            local cmap = (sa and type(sa.ColorMap) == "string") and sa.ColorMap or ""
+            local texKey = (cmap ~= "" and cmap) or tid
+            if mid ~= "" and mid ~= "rbxassetid://0" then
+                table.insert(meshSigParts, mid .. "@" .. rgb .. "@" .. texKey)
+                table.insert(coloredMeshKeys, "MESH:" .. mid .. "@" .. rgb)
+                table.insert(rawMeshKeys, "RAW:" .. mid)
+                if cmap ~= "" and cmap ~= "rbxassetid://0" then
+                    table.insert(mapKeys, "MAP:" .. cmap .. "@" .. rgb)
+                end
+            end
+        elseif d:IsA("SpecialMesh") then
+            local mid = type(d.MeshId) == "string" and d.MeshId or ""
+            local tid = type(d.TextureId) == "string" and d.TextureId or ""
+            local parentCol = (d.Parent and d.Parent:IsA("BasePart")) and colorToRgbKey(d.Parent.Color) or "0,0,0"
+            if mid ~= "" and mid ~= "rbxassetid://0" then
+                table.insert(meshSigParts, mid .. "@" .. parentCol .. "@" .. tid)
+                table.insert(coloredMeshKeys, "MESH:" .. mid .. "@" .. parentCol)
+                table.insert(rawMeshKeys, "RAW:" .. mid)
+            end
+        elseif d:IsA("Animation") then
+            local aid = type(d.AnimationId) == "string" and d.AnimationId or ""
+            if aid ~= "" and aid ~= "rbxassetid://0" then
+                table.insert(animSigParts, aid)
+                table.insert(animKeys, "ANIM:" .. aid)
+            end
+        end
+    end
+
+    table.sort(meshSigParts)
+    table.sort(animSigParts)
+    if #meshSigParts > 0 or #animSigParts > 0 then
+        table.insert(keys, "SIG:" .. table.concat(meshSigParts, "|") .. "::" .. table.concat(animSigParts, "|"))
+    end
+    for _, k in ipairs(mapKeys) do table.insert(keys, k) end
+    for _, k in ipairs(coloredMeshKeys) do table.insert(keys, k) end
+    for _, k in ipairs(animKeys) do table.insert(keys, k) end
+    for _, k in ipairs(rawMeshKeys) do table.insert(keys, k) end
+
+    return keys
+end
+
+local function learnFingerprintKeys(keys, fruitId)
+    if type(keys) ~= "table" or #keys == 0 or type(fruitId) ~= "string" or not FruitMetaById[fruitId] then
+        return false
+    end
+    local updated = false
+    for _, k in ipairs(keys) do
+        local existing = FruitAssetMap[k]
+        if existing == nil then
+            FruitAssetMap[k] = fruitId
+            updated = true
+        elseif existing ~= fruitId and existing ~= "__SHARED__" then
+            -- Auto-demote collisions (e.g. shared stem mesh across two fruits)
+            FruitAssetMap[k] = "__SHARED__"
+            updated = true
+        end
+    end
+    if updated then
+        saveFruitFingerprints(false)
+    end
+    return updated
+end
+
+local function learnFruitFingerprint(instance, fruitId)
+    if not instance or type(fruitId) ~= "string" or not FruitMetaById[fruitId] then return false end
+    return learnFingerprintKeys(extractInstanceAssetFingerprints(instance), fruitId)
+end
+
+local function scanAllVisibleToolsForFingerprints()
+    pcall(function()
+        local function checkContainer(container)
+            if not container then return end
+            for _, ch in ipairs(container:GetChildren()) do
+                if ch:IsA("Tool") and (ch.Name:find("Fruit") or ch:GetAttribute("OriginalName") or ch:GetAttribute("ItemId")) then
+                    local orig = ch:GetAttribute("OriginalName")
+                    local itemId = tonumber(ch:GetAttribute("ItemId"))
+                    local meta = (type(orig) == "string" and FruitMetaById[orig])
+                        or (itemId and FruitMetaByItemId[itemId])
+                        or FruitMetaByShort[ch.Name:gsub(" Fruit$", ""):lower()]
+                    if meta then
+                        learnFruitFingerprint(ch, meta.Id)
+                    end
+                end
+            end
+        end
+
+        checkContainer(LocalPlayer:FindFirstChild("Backpack"))
+        checkContainer(LocalPlayer.Character)
+
+        local wsChars = Workspace:FindFirstChild("Characters")
+        if wsChars then
+            for _, charModel in ipairs(wsChars:GetChildren()) do
+                if charModel ~= LocalPlayer.Character then
+                    checkContainer(charModel)
+                end
+            end
+        end
+
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        local holder = pg and pg:FindFirstChild("__ReplicatedSpinnerInstances")
+        if holder then
+            for _, ch in ipairs(holder:GetChildren()) do
+                local itemId = tonumber(ch:GetAttribute("ItemId")) or tonumber(ch.Name:match("%-(%d+)%]"))
+                local meta = (itemId and FruitMetaByItemId[itemId]) or FruitMetaById[ch.Name:match("^(.-)%s*%[") or ""]
+                if meta then
+                    learnFruitFingerprint(ch, meta.Id)
+                end
             end
         end
     end)
@@ -403,19 +673,72 @@ end
 
 local function resolveFruitMeta(instance)
     if not instance then return nil end
-    local orig = instance:GetAttribute("OriginalName")
-    if type(orig) == "string" and FruitMetaById[orig] then
-        return FruitMetaById[orig]
+
+    -- 1. Check direct Attributes (OriginalName, StorageKey, FruitName, ItemId)
+    local orig = instance:GetAttribute("OriginalName") or instance:GetAttribute("StorageKey") or instance:GetAttribute("FruitName")
+    if type(orig) == "string" and orig ~= "" then
+        local m = FruitMetaById[orig] or FruitMetaByShort[orig:lower()]
+        if m then
+            learnFruitFingerprint(instance, m.Id)
+            return m
+        end
     end
+    local itemIdAttr = tonumber(instance:GetAttribute("ItemId"))
+    if itemIdAttr and FruitMetaByItemId[itemIdAttr] then
+        local m = FruitMetaByItemId[itemIdAttr]
+        learnFruitFingerprint(instance, m.Id)
+        return m
+    end
+
     local name = instance.Name
     if name == "Fruit " or name == "Fruit" then
-        -- Check if any child or attribute hints at the fruit name
-        for _, ch in ipairs(instance:GetChildren()) do
-            local chShort = ch.Name:gsub(" Fruit$", ""):lower()
-            if FruitMetaByShort[chShort] then
-                return FruitMetaByShort[chShort]
+        -- 2. Match Collision-Proof Signature (SIG -> MAP -> MESH@RGB -> ANIM -> RAW)
+        local keys = extractInstanceAssetFingerprints(instance)
+        for _, key in ipairs(keys) do
+            local mappedId = FruitAssetMap[key]
+            if mappedId and mappedId ~= "__SHARED__" and FruitMetaById[mappedId] then
+                return FruitMetaById[mappedId]
+            end
+            -- Backward compatibility for raw rbxassetid keys without prefix
+            local rawPart = key:match("^RAW:(.+)$") or key:match("^ANIM:(.+)$")
+            if rawPart then
+                local legacyMapped = FruitAssetMap[rawPart]
+                if legacyMapped and legacyMapped ~= "__SHARED__" and FruitMetaById[legacyMapped] then
+                    return FruitMetaById[legacyMapped]
+                end
             end
         end
+
+        -- 3. Check all descendant names, attributes, and StringValues for any known fruit name
+        for _, d in ipairs(instance:GetDescendants()) do
+            local dItemId = tonumber(d:GetAttribute("ItemId"))
+            if dItemId and FruitMetaByItemId[dItemId] then
+                local m = FruitMetaByItemId[dItemId]
+                learnFingerprintKeys(keys, m.Id)
+                return m
+            end
+            local dOrig = d:GetAttribute("OriginalName") or d:GetAttribute("FruitName") or (d:IsA("StringValue") and d.Value)
+            if type(dOrig) == "string" and dOrig ~= "" then
+                local m = FruitMetaById[dOrig] or FruitMetaByShort[dOrig:gsub(" Fruit$", ""):lower()]
+                if m then
+                    learnFingerprintKeys(keys, m.Id)
+                    return m
+                end
+            end
+            local dClean = d.Name:gsub(" Fruit$", ""):lower()
+            if FruitMetaByShort[dClean] and dClean ~= "fruit" then
+                local m = FruitMetaByShort[dClean]
+                learnFingerprintKeys(keys, m.Id)
+                return m
+            end
+            for shortKey, metaItem in pairs(FruitMetaByShort) do
+                if #shortKey >= 4 and dClean:find(shortKey, 1, true) then
+                    learnFingerprintKeys(keys, metaItem.Id)
+                    return metaItem
+                end
+            end
+        end
+
         return {
             Id = "Unknown-Spawn",
             Display = "Natural Map Fruit",
@@ -425,13 +748,17 @@ local function resolveFruitMeta(instance)
             IsNaturalSpawn = true,
         }
     end
+
     local clean = name:gsub(" Fruit$", ""):gsub("^%s+", ""):gsub("%s+$", "")
     local candidateId = clean .. "-" .. clean
     if FruitMetaById[candidateId] then
+        learnFruitFingerprint(instance, candidateId)
         return FruitMetaById[candidateId]
     end
     if FruitMetaByShort[clean:lower()] then
-        return FruitMetaByShort[clean:lower()]
+        local m = FruitMetaByShort[clean:lower()]
+        learnFruitFingerprint(instance, m.Id)
+        return m
     end
     local dynamicMeta = {
         Id = orig or candidateId,
@@ -449,6 +776,7 @@ end
 -- ============================================================================
 local WebhookStatus = "Ready (Primary + Backup)"
 local WebhookSentCount = 0
+local ActiveWebhookJobs = 0
 local NotifiedInstances = setmetatable({}, { __mode = "k" })
 
 local function normalizeDiscordUrl(url)
@@ -486,63 +814,67 @@ end
 
 local function sendDiscordWebhook(title, description, colorHex, fields, thumbnailIconUrl)
     if not Config.WebhookEnabled then return end
+    ActiveWebhookJobs = ActiveWebhookJobs + 1
     task.spawn(function()
-        local lpData = LocalPlayer:FindFirstChild("Data")
-        local level = lpData and lpData:FindFirstChild("Level") and lpData.Level.Value or "?"
-        local beli = lpData and lpData:FindFirstChild("Beli") and formatNumber(lpData.Beli.Value) or "?"
-        local df = lpData and lpData:FindFirstChild("DevilFruit") and lpData.DevilFruit.Value or "None"
-        if df == "" then df = "None" end
+        pcall(function()
+            local lpData = LocalPlayer:FindFirstChild("Data")
+            local level = lpData and lpData:FindFirstChild("Level") and lpData.Level.Value or "?"
+            local beli = lpData and lpData:FindFirstChild("Beli") and formatNumber(lpData.Beli.Value) or "?"
+            local df = lpData and lpData:FindFirstChild("DevilFruit") and lpData.DevilFruit.Value or "None"
+            if df == "" then df = "None" end
 
-        local embedFields = fields or {}
-        table.insert(embedFields, {
-            name = "👤 Player Info",
-            value = string.format("`%s` (Lv. %s)\n💰 Beli: `$%s`\n🍎 Equipped: `%s`", LocalPlayer.Name, tostring(level), beli, df),
-            inline = true,
-        })
-        table.insert(embedFields, {
-            name = "🌐 Server JobId",
-            value = string.format("`%s`\nPlayers: `%d/%d`", tostring(game.JobId), #Players:GetPlayers(), Players.MaxPlayers),
-            inline = true,
-        })
+            local embedFields = fields or {}
+            table.insert(embedFields, {
+                name = "👤 Player Info",
+                value = string.format("`%s` (Lv. %s)\n💰 Beli: `$%s`\n🍎 Equipped: `%s`", LocalPlayer.Name, tostring(level), beli, df),
+                inline = true,
+            })
+            table.insert(embedFields, {
+                name = "🌐 Server JobId",
+                value = string.format("`%s`\nPlayers: `%d/%d`", tostring(game.JobId), #Players:GetPlayers(), Players.MaxPlayers),
+                inline = true,
+            })
 
-        local embedObj = {
-            title = title,
-            description = description,
-            color = colorHex or 0x00F5A0,
-            fields = embedFields,
-            thumbnail = {
-                url = (type(thumbnailIconUrl) == "string" and thumbnailIconUrl ~= "") and thumbnailIconUrl or DEFAULT_FRUIT_ICON,
-            },
-            footer = {
-                text = "Aegis Fruit Sniper v3.0 • Blox Fruits Wiki Icons • " .. os.date("%Y-%m-%d %H:%M:%S"),
-            },
-        }
+            local embedObj = {
+                title = title,
+                description = description,
+                color = colorHex or 0x00F5A0,
+                fields = embedFields,
+                thumbnail = {
+                    url = (type(thumbnailIconUrl) == "string" and thumbnailIconUrl ~= "") and thumbnailIconUrl or DEFAULT_FRUIT_ICON,
+                },
+                footer = {
+                    text = "Aegis Fruit Sniper v3.1 Turbo • Blox Fruits Wiki Icons • " .. os.date("%Y-%m-%d %H:%M:%S"),
+                },
+            }
 
-        local bodyTable = {
-            username = "Aegis Fruit Sniper • Blox Fruits",
-            avatar_url = DEFAULT_FRUIT_ICON,
-            embeds = { embedObj },
-        }
+            local bodyTable = {
+                username = "Aegis Fruit Sniper • Blox Fruits",
+                avatar_url = DEFAULT_FRUIT_ICON,
+                embeds = { embedObj },
+            }
 
-        local okJson, payloadJson = pcall(HttpService.JSONEncode, HttpService, bodyTable)
-        if not okJson then return end
+            local okJson, payloadJson = pcall(HttpService.JSONEncode, HttpService, bodyTable)
+            if not okJson then return end
 
-        local okPrimary, statusPrimary = postSingleWebhook(Config.WebhookPrimary, payloadJson)
-        if okPrimary then
-            WebhookSentCount = WebhookSentCount + 1
-            WebhookStatus = "Primary OK (" .. statusPrimary .. ")"
-            if Config.WebhookSendBoth and Config.WebhookBackup ~= "" then
-                postSingleWebhook(Config.WebhookBackup, payloadJson)
-            end
-        else
-            local okBackup, statusBackup = postSingleWebhook(Config.WebhookBackup, payloadJson)
-            if okBackup then
+            local okPrimary, statusPrimary = postSingleWebhook(Config.WebhookPrimary, payloadJson)
+            if okPrimary then
                 WebhookSentCount = WebhookSentCount + 1
-                WebhookStatus = "Fallback Active (" .. statusBackup .. ")"
+                WebhookStatus = "Primary OK (" .. statusPrimary .. ")"
+                if Config.WebhookSendBoth and Config.WebhookBackup ~= "" then
+                    postSingleWebhook(Config.WebhookBackup, payloadJson)
+                end
             else
-                WebhookStatus = "Failed (P:" .. statusPrimary .. " / B:" .. statusBackup .. ")"
+                local okBackup, statusBackup = postSingleWebhook(Config.WebhookBackup, payloadJson)
+                if okBackup then
+                    WebhookSentCount = WebhookSentCount + 1
+                    WebhookStatus = "Fallback Active (" .. statusBackup .. ")"
+                else
+                    WebhookStatus = "Failed (P:" .. statusPrimary .. " / B:" .. statusBackup .. ")"
+                end
             end
-        end
+        end)
+        ActiveWebhookJobs = math.max(0, ActiveWebhookJobs - 1)
     end)
 end
 
@@ -817,17 +1149,24 @@ local MapFruits = {}           -- sorted array of active entries
 local StoredToolCache = setmetatable({}, { __mode = "k" })
 local StoringLock = setmetatable({}, { __mode = "k" })
 local TotalSnipedSession = 0
+local ActiveStoreJobs = 0
 local CurrentSnipeTarget = nil
 local EmptyMapSince = nil
 
 local function isFruitInstance(inst)
     if not inst or not inst.Parent then return false end
+    if inst:GetAttribute("RBX_ReimportId") then return false end
+    local handle = inst:FindFirstChild("Handle")
+    if not handle or not handle:IsA("BasePart") then return false end
+
     if inst:IsA("Tool") then
-        if inst.Name:find("Fruit") or inst:FindFirstChild("EatRemote") or inst:GetAttribute("OriginalName") then
-            return inst:FindFirstChild("Handle") ~= nil
+        if inst.Name:find("Fruit") or inst:FindFirstChild("EatRemote") or inst:GetAttribute("OriginalName") or inst:GetAttribute("ItemId") then
+            return true
         end
     elseif inst:IsA("Model") then
-        if (inst.Name == "Fruit " or inst.Name == "Fruit" or inst.Name:find("Fruit")) and inst:FindFirstChild("Handle") then
+        if inst.Name == "Fruit " or inst.Name == "Fruit" then
+            return true
+        elseif inst.Name:find("Fruit") and (inst:FindFirstChild("Fruit") or inst:FindFirstChild("EatRemote") or inst:GetAttribute("OriginalName") or handle:FindFirstChildOfClass("TouchTransmitter")) then
             return true
         end
     end
@@ -836,26 +1175,40 @@ end
 
 local function shouldSnipeFruit(entry)
     if entry.IsNatural then
-        return Config.SnipeNaturalSpawns
+        if not Config.SnipeNaturalSpawns then return false end
     else
         if not Config.SnipeDroppedTools then return false end
     end
+
     if not Config.OnlySnipeFiltered then
         return true
     end
-    if entry.IsNatural then
+
+    local meta = entry.Meta
+    if not meta or meta.Id == "Unknown-Spawn" or meta.Rarity == "Unknown" then
+        -- Unidentified natural spawn ("Fruit " whose mesh/anim isn't in fingerprint DB yet)
+        if entry.IsNatural then
+            return Config.SnipeUnknownNatural
+        end
+        return false
+    end
+
+    -- Applies exact Rarity & Target Watchlist filter to BOTH Dropped Tools AND Identified Natural Spawns!
+    if Config.TargetFruits[meta.Id] then
         return true
     end
-    local meta = entry.Meta
-    if meta then
-        if Config.TargetFruits[meta.Id] then
-            return true
-        end
-        if Config.AllowedRarities[meta.Rarity] then
-            return true
-        end
+    if Config.AllowedRarities[meta.Rarity] then
+        return true
     end
     return false
+end
+
+local function applyMetaToEntry(entry, meta)
+    entry.Meta = meta
+    entry.Name = entry.IsNatural and (meta and meta.Display ~= "Natural Map Fruit" and ("Map Spawn (" .. meta.Display .. ")") or "Natural Map Fruit (Fruit )") or entry.Instance.Name
+    entry.Rarity = (meta and meta.Rarity) or "Unknown"
+    entry.Icon = (meta and meta.Icon) or DEFAULT_FRUIT_ICON
+    entry.MatchesFilter = shouldSnipeFruit(entry)
 end
 
 local function registerWorkspaceFruit(child)
@@ -865,39 +1218,64 @@ local function registerWorkspaceFruit(child)
     local handle = child:FindFirstChild("Handle")
     if not handle or not handle:IsA("BasePart") then return end
 
-    local meta = resolveFruitMeta(child)
     local isNatural = child:IsA("Model") and (child.Name == "Fruit " or child.Name == "Fruit")
+    -- Brief yield (max 0.2s) only if a natural spawn's Fruit mesh model hasn't replicated alongside Handle yet
+    if isNatural and not child:FindFirstChild("Fruit") and not child:FindFirstChildWhichIsA("MeshPart", true) then
+        local t0 = os.clock()
+        while child.Parent and (os.clock() - t0) < 0.2 do
+            if child:FindFirstChild("Fruit") or child:FindFirstChildWhichIsA("MeshPart", true) then
+                break
+            end
+            task.wait(0.03)
+        end
+        if not child.Parent then return end
+    end
+
+    local meta = resolveFruitMeta(child)
+    local assetKeys = extractInstanceAssetFingerprints(child)
     local hrp = getHRP()
     local dist = hrp and math.floor((hrp.Position - handle.Position).Magnitude) or 0
 
     local entry = {
         Instance = child,
         Handle = handle,
-        Name = isNatural and (meta and meta.Display ~= "Natural Map Fruit" and ("Map Spawn (" .. meta.Display .. ")") or "Natural Map Fruit (Fruit )") or child.Name,
+        Name = child.Name,
         Meta = meta,
-        Rarity = meta and meta.Rarity or "Unknown",
-        Icon = (meta and meta.Icon) or DEFAULT_FRUIT_ICON,
+        Rarity = "Unknown",
+        Icon = DEFAULT_FRUIT_ICON,
         Distance = dist,
         Position = handle.Position,
         IsNatural = isNatural,
         MatchesFilter = false,
+        AssetKeys = assetKeys,
+        CreatedAt = os.clock(),
     }
-    entry.MatchesFilter = shouldSnipeFruit(entry)
+    applyMetaToEntry(entry, meta)
     TrackedFruitEntries[child] = entry
 
     if not NotifiedInstances[child] then
         NotifiedInstances[child] = true
         if Config.NotifyOnDetect then
-            sendDiscordWebhook(
-                "📡 Fruit Detected on Map!",
-                string.format("A **%s** was detected in `Workspace`!", entry.Name),
-                RarityDiscordColors[entry.Rarity] or 0x00D9F5,
-                {
-                    { name = "🍏 Fruit", value = string.format("`%s`\nType: `%s`", meta and meta.Display or entry.Name, isNatural and "Natural Hourly Spawn" or "Dropped Tool"), inline = true },
-                    { name = "✨ Rarity & Distance", value = string.format("Rarity: **%s**\nDistance: `%d studs`", entry.Rarity, dist), inline = true },
-                },
-                entry.Icon
-            )
+            local function emitDetectWebhook()
+                if not entry then return end
+                local finalMeta = entry.Meta
+                sendDiscordWebhook(
+                    "📡 Fruit Detected on Map!",
+                    string.format("A **%s** was detected in `Workspace`!", entry.Name),
+                    RarityDiscordColors[entry.Rarity] or 0x00D9F5,
+                    {
+                        { name = "🍏 Fruit", value = string.format("`%s`\nType: `%s`", finalMeta and finalMeta.Display or entry.Name, isNatural and "Natural Hourly Spawn" or "Dropped Tool"), inline = true },
+                        { name = "✨ Rarity & Distance", value = string.format("Rarity: **%s**\nDistance: `%d studs`", entry.Rarity, entry.Distance), inline = true },
+                    },
+                    entry.Icon
+                )
+            end
+            if isNatural and entry.Rarity == "Unknown" then
+                -- Give mesh replication 250ms to finish before posting Discord webhook so name/image are accurate
+                task.delay(0.25, emitDetectWebhook)
+            else
+                emitDetectWebhook()
+            end
         end
     end
 
@@ -914,13 +1292,25 @@ end
 local function rebuildSortedMapFruits()
     local hrp = getHRP()
     local hrpPos = hrp and hrp.Position or Vector3.zero
+    local now = os.clock()
     local list = {}
 
     for inst, entry in pairs(TrackedFruitEntries) do
         if inst and inst.Parent == Workspace and entry.Handle and entry.Handle.Parent then
             entry.Position = entry.Handle.Position
             entry.Distance = hrp and math.floor((hrpPos - entry.Position).Magnitude) or 0
-            entry.MatchesFilter = shouldSnipeFruit(entry)
+            -- Late-streaming re-identification during the first 2.5s if Fruit mesh wasn't ready at registration
+            if entry.IsNatural and entry.Meta and entry.Meta.Id == "Unknown-Spawn" and (now - (entry.CreatedAt or now)) <= 2.5 then
+                local freshMeta = resolveFruitMeta(inst)
+                if freshMeta and freshMeta.Id ~= "Unknown-Spawn" then
+                    entry.AssetKeys = extractInstanceAssetFingerprints(inst)
+                    applyMetaToEntry(entry, freshMeta)
+                else
+                    entry.MatchesFilter = shouldSnipeFruit(entry)
+                end
+            else
+                entry.MatchesFilter = shouldSnipeFruit(entry)
+            end
             table.insert(list, entry)
         else
             TrackedFruitEntries[inst] = nil
@@ -947,7 +1337,7 @@ local function fullRescanWorkspace()
     return rebuildSortedMapFruits()
 end
 
--- Event-Driven Workspace Listeners (Instant reaction when a fruit spawns/drops)
+-- Event-Driven Workspace Listeners (Instant 0ms reaction when a fruit spawns/drops)
 addConnection(Workspace.ChildAdded, function(child)
     if not isScriptAlive() then return end
     task.defer(function()
@@ -956,7 +1346,7 @@ addConnection(Workspace.ChildAdded, function(child)
             registerWorkspaceFruit(child)
             rebuildSortedMapFruits()
         elseif child.Name == "Fruit " or child.Name == "Fruit" or child.Name:find("Fruit") then
-            local h = child:WaitForChild("Handle", 1.5)
+            local h = child:WaitForChild("Handle", 1.2)
             if h and isScriptAlive() then
                 registerWorkspaceFruit(child)
                 rebuildSortedMapFruits()
@@ -966,7 +1356,15 @@ addConnection(Workspace.ChildAdded, function(child)
 end)
 
 addConnection(Workspace.ChildRemoved, function(child)
-    if TrackedFruitEntries[child] then
+    local entry = TrackedFruitEntries[child]
+    if entry then
+        if entry.IsNatural and entry.Meta and entry.Meta.Id == "Unknown-Spawn" and entry.AssetKeys and #entry.AssetKeys > 0 then
+            PendingNaturalLearn = {
+                Keys = entry.AssetKeys,
+                Pos = entry.Position,
+                RemovedAt = os.clock(),
+            }
+        end
         TrackedFruitEntries[child] = nil
         if CurrentSnipeTarget and CurrentSnipeTarget.Instance == child then
             CurrentSnipeTarget = nil
@@ -976,79 +1374,99 @@ end)
 
 -- Instant Single-Tool Auto-Store Function
 local function storeSingleFruitTool(tool)
-    if not Config.AutoStoreFruits or not tool or not tool.Parent or not tool:IsA("Tool") then return end
-    if StoredToolCache[tool] == "STORED" or StoredToolCache[tool] == "FULL" or StoringLock[tool] then return end
-    if not (tool.Name:find("Fruit") or tool:FindFirstChild("EatRemote") or tool:GetAttribute("OriginalName")) then return end
+    if not tool or not tool.Parent or not tool:IsA("Tool") then return end
+    if not (tool.Name:find("Fruit") or tool:FindFirstChild("EatRemote") or tool:GetAttribute("OriginalName") or tool:GetAttribute("ItemId")) then return end
 
-    StoringLock[tool] = true
-    task.spawn(function()
-        local commF = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
-        if not commF then
-            StoringLock[tool] = nil
-            return
-        end
-
-        local origName = tool:GetAttribute("OriginalName")
-        if type(origName) ~= "string" or origName == "" then
+    local origName = tool:GetAttribute("OriginalName")
+    if type(origName) ~= "string" or origName == "" then
+        local itemIdAttr = tonumber(tool:GetAttribute("ItemId"))
+        if itemIdAttr and FruitMetaByItemId[itemIdAttr] then
+            origName = FruitMetaByItemId[itemIdAttr].Id
+        else
             local clean = tool.Name:gsub(" Fruit$", ""):gsub("^%s+", ""):gsub("%s+$", "")
             origName = clean .. "-" .. clean
         end
-        local meta = FruitMetaById[origName] or resolveFruitMeta(tool)
-        local iconUrl = (meta and meta.Icon) or DEFAULT_FRUIT_ICON
+    end
 
-        local ok, res = pcall(function()
-            return commF:InvokeServer("StoreFruit", origName, tool)
+    -- Auto-learn fingerprint immediately from the physical Tool & any recently picked-up natural spawn!
+    if FruitMetaById[origName] then
+        learnFruitFingerprint(tool, origName)
+        if PendingNaturalLearn and (os.clock() - PendingNaturalLearn.RemovedAt) <= 4.0 then
+            local hrp = getHRP()
+            if not hrp or (hrp.Position - PendingNaturalLearn.Pos).Magnitude <= 90 then
+                learnFingerprintKeys(PendingNaturalLearn.Keys, origName)
+                PendingNaturalLearn = nil
+            end
+        end
+    end
+
+    if not Config.AutoStoreFruits then return end
+    if StoredToolCache[tool] == "STORED" or StoredToolCache[tool] == "FULL" or StoringLock[tool] then return end
+
+    StoringLock[tool] = true
+    ActiveStoreJobs = ActiveStoreJobs + 1
+    task.spawn(function()
+        pcall(function()
+            local commF = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+            if not commF then return end
+
+            local meta = FruitMetaById[origName] or resolveFruitMeta(tool)
+            local iconUrl = (meta and meta.Icon) or DEFAULT_FRUIT_ICON
+
+            local ok, res = pcall(function()
+                return commF:InvokeServer("StoreFruit", origName, tool)
+            end)
+
+            if (not ok or res == false or res == nil) and tool.Parent then
+                local hum = getHumanoid()
+                local char = getCharacter()
+                if hum and char and tool.Parent ~= char then
+                    pcall(function() hum:EquipTool(tool) end)
+                    task.wait(0.08)
+                    ok, res = pcall(function()
+                        return commF:InvokeServer("StoreFruit", origName, tool)
+                    end)
+                end
+            end
+
+            if ok and res == true then
+                StoredToolCache[tool] = "STORED"
+                TotalSnipedSession = TotalSnipedSession + 1
+                if Config.NotifyOnStore then
+                    sendDiscordWebhook(
+                        "✅ Fruit Sniped & Stored!",
+                        string.format("Successfully stored **%s** (`%s`) into your inventory!", tool.Name, origName),
+                        RarityDiscordColors[meta and meta.Rarity or "Mythical"] or 0x00F5A0,
+                        {
+                            { name = "🍏 Stored Fruit", value = string.format("**%s**\nID: `%s`", tool.Name, origName), inline = true },
+                            { name = "💎 Rarity & Value", value = string.format("Rarity: **%s**\nValue: `$%s`", meta and meta.Rarity or "Unknown", formatNumber(meta and meta.Price or 0)), inline = true },
+                            { name = "📦 Session Total", value = string.format("`%d` fruit(s) stored this session", TotalSnipedSession), inline = false },
+                        },
+                        iconUrl
+                    )
+                end
+            elseif ok and typeof(res) == "number" then
+                StoredToolCache[tool] = "FULL"
+                if Config.NotifyOnStore then
+                    sendDiscordWebhook(
+                        "⚠️ Fruit Picked Up (Storage Full!)",
+                        string.format("Picked up **%s** (`%s`), but your storage capacity (`%d`) for this fruit is full!", tool.Name, origName, res),
+                        0xF59E0B,
+                        {
+                            { name = "🍏 Fruit Held", value = string.format("**%s** (`%s`)", tool.Name, origName), inline = true },
+                            { name = "📦 Capacity Limit", value = string.format("Max Capacity: `%d/%d`", res, res), inline = true },
+                        },
+                        iconUrl
+                    )
+                end
+            end
         end)
-
-        if (not ok or res == false or res == nil) and tool.Parent then
-            local hum = getHumanoid()
-            local char = getCharacter()
-            if hum and char and tool.Parent ~= char then
-                pcall(function() hum:EquipTool(tool) end)
-                task.wait(0.1)
-                ok, res = pcall(function()
-                    return commF:InvokeServer("StoreFruit", origName, tool)
-                end)
-            end
-        end
-
-        if ok and res == true then
-            StoredToolCache[tool] = "STORED"
-            TotalSnipedSession = TotalSnipedSession + 1
-            if Config.NotifyOnStore then
-                sendDiscordWebhook(
-                    "✅ Fruit Sniped & Stored!",
-                    string.format("Successfully stored **%s** (`%s`) into your inventory!", tool.Name, origName),
-                    RarityDiscordColors[meta and meta.Rarity or "Mythical"] or 0x00F5A0,
-                    {
-                        { name = "🍏 Stored Fruit", value = string.format("**%s**\nID: `%s`", tool.Name, origName), inline = true },
-                        { name = "💎 Rarity & Value", value = string.format("Rarity: **%s**\nValue: `$%s`", meta and meta.Rarity or "Unknown", formatNumber(meta and meta.Price or 0)), inline = true },
-                        { name = "📦 Session Total", value = string.format("`%d` fruit(s) stored this session", TotalSnipedSession), inline = false },
-                    },
-                    iconUrl
-                )
-            end
-        elseif ok and typeof(res) == "number" then
-            StoredToolCache[tool] = "FULL"
-            if Config.NotifyOnStore then
-                sendDiscordWebhook(
-                    "⚠️ Fruit Picked Up (Storage Full!)",
-                    string.format("Picked up **%s** (`%s`), but your storage capacity (`%d`) for this fruit is full!", tool.Name, origName, res),
-                    0xF59E0B,
-                    {
-                        { name = "🍏 Fruit Held", value = string.format("**%s** (`%s`)", tool.Name, origName), inline = true },
-                        { name = "📦 Capacity Limit", value = string.format("Max Capacity: `%d/%d`", res, res), inline = true },
-                    },
-                    iconUrl
-                )
-            end
-        end
         StoringLock[tool] = nil
+        ActiveStoreJobs = math.max(0, ActiveStoreJobs - 1)
     end)
 end
 
 local function storeAllCurrentFruitTools()
-    if not Config.AutoStoreFruits then return end
     local char = getCharacter()
     if char then
         for _, c in ipairs(char:GetChildren()) do
@@ -1093,6 +1511,7 @@ addConnection(LocalPlayer.CharacterAdded, function(newChar)
     task.defer(function()
         refreshCharacterCache(newChar)
         hookInventoryListeners()
+        fullRescanWorkspace()
     end)
 end)
 
@@ -1184,12 +1603,12 @@ local function rollCousinGacha()
     local ok, res = pcall(function()
         return commF:InvokeServer("Cousin", "Buy")
     end)
-    task.delay(0.25, storeAllCurrentFruitTools)
+    task.delay(0.2, storeAllCurrentFruitTools)
     return ok, res
 end
 
 -- ============================================================================
--- 7. CRASH-SAFE SMART SERVER HOPPER (Anti-Same-Server Blacklist + Cached Pool)
+-- 7. TURBO SMART SERVER HOPPER (Pre-Warmed 100-Server Pool + Zero-Repeat Blacklist)
 -- ============================================================================
 local IsHopping = false
 local EspObjects = {} -- [instance] = { Text = Drawing, Line = Drawing }
@@ -1211,7 +1630,6 @@ local function loadServerHopCache()
             end
         end
     end)
-    -- Always blacklist the current server JobId immediately
     if game.JobId and game.JobId ~= "" then
         VisitedServers[tostring(game.JobId)] = nowUnix
     end
@@ -1264,75 +1682,95 @@ local function shuffleArray(arr)
     end
 end
 
+local IsFetchingPool = false
 local function fetchFreshServerIds(placeId)
-    local currentJobId = tostring(game.JobId)
-    local nowUnix = os.time()
-    local seen = {}
-    for _, existingId in ipairs(CachedServerPool) do
-        seen[existingId] = true
-    end
+    if IsFetchingPool then return end
+    IsFetchingPool = true
 
-    local endpoints = {
-        string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
-        string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
-        string.format("https://games.roproxy.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
-    }
+    pcall(function()
+        local currentJobId = tostring(game.JobId)
+        local nowUnix = os.time()
+        local seen = {}
+        for _, existingId in ipairs(CachedServerPool) do
+            seen[existingId] = true
+        end
 
-    if math.random(1, 2) == 2 then
-        endpoints[1], endpoints[2] = endpoints[2], endpoints[1]
-    end
+        local endpoints = {
+            string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
+            string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", placeId),
+            string.format("https://games.roproxy.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true", placeId),
+        }
 
-    for _, baseUrl in ipairs(endpoints) do
-        local cursor = ""
-        for page = 1, 2 do
-            local url = baseUrl .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
-            local ok, resp = pcall(function()
-                return HttpService:JSONDecode(game:HttpGet(url))
-            end)
-            if ok and type(resp) == "table" and type(resp.data) == "table" then
-                local addedCount = 0
-                for _, srv in ipairs(resp.data) do
-                    if type(srv) == "table" and type(srv.id) == "string" then
-                        local jid = srv.id
-                        local playing = tonumber(srv.playing) or 0
-                        local maxP = tonumber(srv.maxPlayers) or 12
-                        local visitedTs = VisitedServers[jid]
-                        local isVisited = visitedTs and ((nowUnix - visitedTs) < VISITED_TTL)
-                        if jid ~= currentJobId
-                            and not isVisited
-                            and not seen[jid]
-                            and playing >= 1
-                            and playing < maxP then
-                            seen[jid] = true
-                            table.insert(CachedServerPool, jid)
-                            addedCount = addedCount + 1
+        if math.random(1, 2) == 2 then
+            endpoints[1], endpoints[2] = endpoints[2], endpoints[1]
+        end
+
+        for _, baseUrl in ipairs(endpoints) do
+            local cursor = ""
+            for page = 1, 4 do
+                local url = baseUrl .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
+                local ok, resp = pcall(function()
+                    return HttpService:JSONDecode(game:HttpGet(url))
+                end)
+                if ok and type(resp) == "table" and type(resp.data) == "table" then
+                    for _, srv in ipairs(resp.data) do
+                        if type(srv) == "table" and type(srv.id) == "string" then
+                            local jid = srv.id
+                            local playing = tonumber(srv.playing) or 0
+                            local maxP = tonumber(srv.maxPlayers) or 12
+                            local visitedTs = VisitedServers[jid]
+                            local isVisited = visitedTs and ((nowUnix - visitedTs) < VISITED_TTL)
+                            if jid ~= currentJobId
+                                and not isVisited
+                                and not seen[jid]
+                                and playing >= 1
+                                and playing < maxP then
+                                seen[jid] = true
+                                table.insert(CachedServerPool, jid)
+                            end
                         end
                     end
-                end
-                if addedCount >= 25 then
-                    break
-                end
-                if type(resp.nextPageCursor) == "string" and resp.nextPageCursor ~= "" then
-                    cursor = resp.nextPageCursor
+                    -- Keep all ~100 valid servers returned by this request! Only paginate further if pool is still small.
+                    if #CachedServerPool >= 25 then
+                        break
+                    end
+                    if type(resp.nextPageCursor) == "string" and resp.nextPageCursor ~= "" then
+                        cursor = resp.nextPageCursor
+                    else
+                        break
+                    end
                 else
                     break
                 end
-            else
+            end
+            if #CachedServerPool >= 25 then
                 break
             end
         end
-        if #CachedServerPool >= 25 then
-            break
-        end
-    end
 
-    shuffleArray(CachedServerPool)
-    saveServerHopCache()
+        shuffleArray(CachedServerPool)
+        saveServerHopCache()
+    end)
+
+    IsFetchingPool = false
+end
+
+-- Start scanning & pre-warming server pool IMMEDIATELY before UI even finishes loading!
+hookInventoryListeners()
+fullRescanWorkspace()
+storeAllCurrentFruitTools()
+task.spawn(scanAllVisibleToolsForFingerprints)
+if #CachedServerPool < 25 then
+    task.spawn(function()
+        fetchFreshServerIds(game.PlaceId)
+    end)
 end
 
 local TeleportFailedSignal = false
+local LastTeleportFailResult = nil
 addConnection(TeleportService.TeleportInitFailed, function(_, teleportResult, errorMessage)
     TeleportFailedSignal = true
+    LastTeleportFailResult = teleportResult
 end)
 
 local function hopToNewServer()
@@ -1356,11 +1794,15 @@ local function hopToNewServer()
     end
 
     task.spawn(function()
-        task.wait(0.1)
+        -- Wait briefly ONLY if a StoreFruit invoke or Discord webhook POST is actively in-flight
+        local waitFlushed = os.clock()
+        while (ActiveStoreJobs > 0 or ActiveWebhookJobs > 0) and (os.clock() - waitFlushed) < 1.5 do
+            task.wait(0.05)
+        end
+
         local placeId = game.PlaceId
         local currentJobId = tostring(game.JobId)
 
-        -- Filter out any already-visited servers from CachedServerPool
         local cleanPool = {}
         local nowUnix = os.time()
         for _, jid in ipairs(CachedServerPool) do
@@ -1371,18 +1813,19 @@ local function hopToNewServer()
         end
         CachedServerPool = cleanPool
 
-        -- Fetch new servers if our cached pool is low
-        if #CachedServerPool < 10 then
-            fetchFreshServerIds(placeId)
+        if #CachedServerPool == 0 then
+            while IsFetchingPool do task.wait(0.05) end
+            if #CachedServerPool == 0 then
+                fetchFreshServerIds(placeId)
+            end
         end
 
-        -- Try up to 15 distinct unvisited JobIds from the pool
         for attempt = 1, 15 do
             if not isScriptAlive() then break end
             if #CachedServerPool == 0 then
                 fetchFreshServerIds(placeId)
                 if #CachedServerPool == 0 then
-                    task.wait(2)
+                    task.wait(1.0)
                     fetchFreshServerIds(placeId)
                 end
             end
@@ -1392,25 +1835,29 @@ local function hopToNewServer()
                 VisitedServers[chosen] = os.time()
                 saveServerHopCache()
                 TeleportFailedSignal = false
+                LastTeleportFailResult = nil
 
                 pcall(function()
                     TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
                 end)
 
-                -- Wait up to 10s for teleport transition; ONLY retry another server if TeleportInitFailed actually fires!
                 local waitStart = os.clock()
                 while (os.clock() - waitStart) < 10 do
                     if TeleportFailedSignal or not isScriptAlive() then
                         break
                     end
-                    task.wait(0.2)
+                    task.wait(0.08)
                 end
 
                 if not TeleportFailedSignal then
-                    -- Teleport is in progress without error; do NOT spam another TeleportToPlaceInstance mid-transition!
                     break
                 end
-                task.wait(0.5)
+
+                if LastTeleportFailResult == Enum.TeleportResult.Flooded then
+                    task.wait(1.2)
+                else
+                    task.wait(0.12)
+                end
             end
         end
 
@@ -1462,11 +1909,13 @@ addConnection(RunService.RenderStepped, function()
 
             local pos3D = handle.Position
             local screenPos, onScreen = Camera:WorldToViewportPoint(Vector3.new(pos3D.X, pos3D.Y + 2.5, pos3D.Z))
-            local col = RarityColors[entry.Rarity] or RarityColors.Unknown
+            local isSkipped = Config.OnlySnipeFiltered and not entry.MatchesFilter
+            local col = isSkipped and Color3.fromHex("#94A3B8") or (RarityColors[entry.Rarity] or RarityColors.Unknown)
 
             if onScreen then
                 local tag = entry.IsNatural and "[MAP SPAWN]" or "[DROPPED]"
-                obj.Text.Text = string.format("%s %s\n[%s] • %d studs", tag, entry.Meta and entry.Meta.Display or entry.Name, entry.Rarity:upper(), entry.Distance)
+                local skipPrefix = isSkipped and "[SKIPPED] " or ""
+                obj.Text.Text = string.format("%s%s %s\n[%s] • %d studs", skipPrefix, tag, entry.Meta and entry.Meta.Display or entry.Name, entry.Rarity:upper(), entry.Distance)
                 obj.Text.Position = Vector2.new(screenPos.X, screenPos.Y)
                 obj.Text.Color = col
                 obj.Text.Visible = true
@@ -1541,7 +1990,7 @@ HudTitle.Font = Enum.Font.GothamBold
 HudTitle.TextSize = 13
 HudTitle.TextXAlignment = Enum.TextXAlignment.Left
 HudTitle.TextColor3 = Color3.fromHex("#00F5A0")
-HudTitle.Text = "⚡ AEGIS FRUIT SNIPER v3.0 • LIVE RADAR"
+HudTitle.Text = "⚡ AEGIS FRUIT SNIPER v3.1 • TURBO RADAR"
 HudTitle.Parent = HudCard
 
 local HudStatusLine = Instance.new("TextLabel")
@@ -1599,9 +2048,42 @@ ProgressFillCorner.CornerRadius = UDim.new(1, 0)
 ProgressFillCorner.Parent = ProgressFill
 
 -- ============================================================================
--- 10. LOAD & CUSTOMIZE WINDUI LIBRARY
+-- 10. LOAD & CUSTOMIZE WINDUI LIBRARY (Disk-Cached for Instant Hop Startup)
 -- ============================================================================
-local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+local WINDUI_CACHE_FILE = "AegisFruitSniper/windui_cache.lua"
+local WINDUI_URL        = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+
+local function loadWindUILibrary()
+    local cachedSource
+    pcall(function()
+        if isfile and readfile and isfile(WINDUI_CACHE_FILE) then
+            local raw = readfile(WINDUI_CACHE_FILE)
+            if type(raw) == "string" and #raw > 10000 then
+                cachedSource = raw
+            end
+        end
+    end)
+
+    if cachedSource then
+        local ok, lib = pcall(function()
+            return loadstring(cachedSource)()
+        end)
+        if ok and type(lib) == "table" then
+            return lib
+        end
+    end
+
+    local freshSource = game:HttpGet(WINDUI_URL)
+    pcall(function()
+        if writefile and type(freshSource) == "string" and #freshSource > 10000 then
+            ensureConfigFolder()
+            writefile(WINDUI_CACHE_FILE, freshSource)
+        end
+    end)
+    return loadstring(freshSource)()
+end
+
+local WindUI = loadWindUILibrary()
 
 pcall(function()
     WindUI:AddTheme({
@@ -1626,9 +2108,9 @@ pcall(function()
 end)
 
 local Window = WindUI:CreateWindow({
-    Title = "AEGIS FRUIT SNIPER • v3.0",
+    Title = "AEGIS FRUIT SNIPER • v3.1",
     Icon = "radar",
-    Author = "Ultra-Light • Wiki Webhook Icons • GitHub Loadstring",
+    Author = "Turbo Scan/Hop • Pre-ID Natural Spawns • Wiki Icons",
     Folder = "AegisFruitSniper",
     Size = UDim2.fromOffset(630, 480),
     MinSize = Vector2.new(560, 380),
@@ -1648,7 +2130,7 @@ local Window = WindUI:CreateWindow({
         ButtonsType = "Mac",
     },
     OpenButton = {
-        Title = "Aegis v3.0",
+        Title = "Aegis v3.1",
         Icon = "radar",
         CornerRadius = UDim.new(0, 14),
         StrokeThickness = 2,
@@ -1668,7 +2150,7 @@ local Window = WindUI:CreateWindow({
 
 pcall(function()
     Window:Tag({
-        Title = "v3.0 ULTRA-LIGHT",
+        Title = "v3.1 TURBO",
         Color = Color3.fromHex("#00F5A0"),
     })
     Window:Tag({
@@ -1797,12 +2279,29 @@ TabRadar:Button({
 -- ---- TAB 2: FRUIT FILTER ----
 TabFilter:Section({ Title = "Fruit Source Types" })
 
+local FingerprintDbParagraph = TabFilter:Paragraph({
+    Title = "🧬 Pre-Pickup Natural Spawn DB",
+    Desc = string.format("Learned %d fruit 3D mesh fingerprints (auto-learns on pickup & visible tools).", LearnedFruitCount),
+})
+
 TabFilter:Toggle({
     Title = "Snipe Natural Hourly Map Spawns ('Fruit ')",
     Desc = "Targets natural hourly-spawned Model fruits in Workspace.",
     Value = Config.SnipeNaturalSpawns,
     Callback = function(state)
         Config.SnipeNaturalSpawns = state
+        rebuildSortedMapFruits()
+        saveConfig()
+    end,
+})
+
+TabFilter:Toggle({
+    Title = "Snipe Unidentified Natural Spawns (Auto-Learn)",
+    Desc = "When enabled, grabs unlearned 'Fruit ' spawns once to fingerprint their 3D mesh permanently. Turn OFF to skip unknown meshes too.",
+    Value = Config.SnipeUnknownNatural,
+    Callback = function(state)
+        Config.SnipeUnknownNatural = state
+        rebuildSortedMapFruits()
         saveConfig()
     end,
 })
@@ -1813,6 +2312,7 @@ TabFilter:Toggle({
     Value = Config.SnipeDroppedTools,
     Callback = function(state)
         Config.SnipeDroppedTools = state
+        rebuildSortedMapFruits()
         saveConfig()
     end,
 })
@@ -2016,18 +2516,41 @@ TabFlight:Toggle({
     end,
 })
 
+TabFlight:Toggle({
+    Title = "⚡ Turbo Fast Scan & Hop Mode",
+    Desc = "Uses WindUI disk cache, 1.0s join grace, <=1.0s hop wait, and pre-warmed server pool for rapid server hopping.",
+    Icon = "zap",
+    Value = Config.TurboFastHop,
+    Callback = function(state)
+        Config.TurboFastHop = state
+        EmptyMapSince = nil
+        saveConfig()
+    end,
+})
+
 TabFlight:Slider({
     Title = "Server Hop Wait Delay (seconds)",
-    Desc = "How long to wait on an empty map before hopping servers.",
+    Desc = "Wait duration when no target fruits exist (Turbo Mode caps effective wait at <=1.0s).",
     Value = {
-        Min = 5,
+        Min = 0,
         Max = 120,
-        Default = Config.ServerHopDelay,
+        Default = math.clamp(tonumber(Config.ServerHopDelay) or 2, 0, 120),
     },
     Step = 1,
     Callback = function(val)
-        Config.ServerHopDelay = tonumber(val) or 15
+        Config.ServerHopDelay = tonumber(val) or 2
         saveConfig()
+    end,
+})
+
+TabFlight:Button({
+    Title = "🔄 Refresh Server Pool Cache",
+    Desc = "Pre-fetches unvisited Blox Fruits servers in the background for instant hops.",
+    Icon = "refresh-cw",
+    Callback = function()
+        task.spawn(function()
+            fetchFreshServerIds(game.PlaceId)
+        end)
     end,
 })
 
@@ -2160,7 +2683,7 @@ TabWebhook:Button({
         local thumbUrl = (eqMeta and eqMeta.Icon) or DEFAULT_FRUIT_ICON
 
         sendDiscordWebhook(
-            "🟢 Aegis Fruit Sniper v3.0 — Wiki Image Webhook Verified!",
+            "🟢 Aegis Fruit Sniper v3.1 TURBO — Wiki Image Webhook Verified!",
             string.format(
                 "Dual Webhook + **Blox Fruits Wiki Fruit Thumbnails** are online!\nCurrently tracking **%d** fruit(s) in `Workspace`.\nFeatured Icon: **%s**",
                 #list,
@@ -2183,7 +2706,7 @@ TabWebhook:Button({
 })
 
 -- ============================================================================
--- 12. ULTRA-LIGHTWEIGHT MASTER ORCHESTRATOR LOOP
+-- 12. ULTRA-LIGHTWEIGHT MASTER ORCHESTRATOR LOOP (Turbo 0.1s Tick)
 -- ============================================================================
 task.spawn(function()
     fullRescanWorkspace()
@@ -2195,7 +2718,11 @@ task.spawn(function()
     end)
 
     local lastFullRescan = os.clock()
+    local lastToolLearnScan = os.clock()
+    local lastPoolCheck = os.clock()
+    local lastTeamAttempt = 0
     local lastGachaAttempt = 0
+    local lastLearnedCount = -1
     local lastRadarText = ""
     local lastDealerText = ""
     local lastHudStatus = ""
@@ -2205,19 +2732,22 @@ task.spawn(function()
     while isScriptAlive() do
         local now = os.clock()
 
-        -- 1. Auto Join Team if player has no Character
-        if not getCharacter() and Config.AutoJoinTeam ~= "Disabled" then
-            pcall(function()
-                local commF = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
-                if commF then
-                    commF:InvokeServer("SetTeam", Config.AutoJoinTeam)
-                end
+        -- 1. Auto Join Team if player has no Character (non-blocking)
+        if not getCharacter() and Config.AutoJoinTeam ~= "Disabled" and (now - lastTeamAttempt) >= 0.5 then
+            lastTeamAttempt = now
+            task.spawn(function()
+                pcall(function()
+                    local commF = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+                    if commF then
+                        commF:InvokeServer("SetTeam", Config.AutoJoinTeam)
+                    end
+                end)
             end)
         end
 
-        -- 2. Hook Backpack/Character listeners & periodic lightweight reconciliation
+        -- 2. Hook Backpack/Character listeners & rapid 1.0s workspace reconciliation
         hookInventoryListeners()
-        if (now - lastFullRescan) >= 2.5 then
+        if (now - lastFullRescan) >= 1.0 then
             lastFullRescan = now
             fullRescanWorkspace()
             if Config.AutoStoreFruits then
@@ -2225,6 +2755,18 @@ task.spawn(function()
             end
         else
             rebuildSortedMapFruits()
+        end
+
+        -- Background tool fingerprint harvesting & server pool pre-warming
+        if (now - lastToolLearnScan) >= 8 then
+            lastToolLearnScan = now
+            task.spawn(scanAllVisibleToolsForFingerprints)
+        end
+        if #CachedServerPool < 15 and not IsFetchingPool and (now - lastPoolCheck) >= 8 then
+            lastPoolCheck = now
+            task.spawn(function()
+                fetchFreshServerIds(game.PlaceId)
+            end)
         end
 
         local fruits = MapFruits
@@ -2258,11 +2800,14 @@ task.spawn(function()
             end
         end
 
-        -- Smart Server Hop check when no target fruits exist on map (waits 5s after join for streaming)
-        if Config.AutoServerHop and not IsHopping and not FlightState.Active and targetEntry == nil and (now - ScriptStartTime) >= 5 and getCharacter() ~= nil then
+        -- Smart Server Hop check when no target fruits exist on map (Turbo Mode: 1.0s join grace, <=1.0s hop delay)
+        local joinGrace = Config.TurboFastHop and 1.0 or 3.0
+        local rawDelay = tonumber(Config.ServerHopDelay) or 2
+        local effectiveDelay = Config.TurboFastHop and math.min(rawDelay, 1.0) or rawDelay
+        if Config.AutoServerHop and not IsHopping and not FlightState.Active and ActiveStoreJobs == 0 and targetEntry == nil and (now - ScriptStartTime) >= joinGrace and getCharacter() ~= nil then
             if not EmptyMapSince then
                 EmptyMapSince = now
-            elseif (now - EmptyMapSince) >= Config.ServerHopDelay then
+            elseif (now - EmptyMapSince) >= effectiveDelay then
                 EmptyMapSince = now + 999
                 hopToNewServer()
             end
@@ -2292,15 +2837,19 @@ task.spawn(function()
                 local startD = math.max(FlightState.StartDistance, 1)
                 local pct = math.clamp(1 - (FlightState.CurrentDistance / startD), 0.05, 1)
                 ProgressFill.Size = UDim2.new(pct, 0, 1, 0)
-            elseif Config.AutoServerHop and EmptyMapSince and #fruits == 0 then
-                local rem = math.max(0, math.ceil(Config.ServerHopDelay - (now - EmptyMapSince)))
-                newStatus = string.format("🌐 Map Empty — Hopping in %ds...", rem)
+            elseif Config.AutoServerHop and EmptyMapSince and not targetEntry then
+                local rem = math.max(0, effectiveDelay - (now - EmptyMapSince))
+                if #fruits > 0 then
+                    newStatus = string.format("⏭️ Skipped %d Non-Target — Hop in %.1fs", #fruits, rem)
+                else
+                    newStatus = string.format("🌐 Map Empty — Hopping in %.1fs...", rem)
+                end
                 HudStatusLine.TextColor3 = Color3.fromHex("#38BDF8")
                 ProgressFill.Size = UDim2.new(0, 0, 1, 0)
             else
                 newStatus = (#fruits > 0)
-                    and string.format("📡 %d Fruit(s) on Map! Nearest: %s (%dm)", #fruits, fruits[1].Name, fruits[1].Distance)
-                    or "📡 Status: Event-Driven Radar Active (0 Fruits)"
+                    and string.format("📡 %d Fruit(s) on Map! Nearest: %s (%dm)", #fruits, fruits[1].Meta and fruits[1].Meta.Display or fruits[1].Name, fruits[1].Distance)
+                    or "📡 Status: Turbo Radar Active (0 Fruits)"
                 HudStatusLine.TextColor3 = (#fruits > 0) and Color3.fromHex("#FBBF24") or Color3.fromHex("#E2E8F0")
                 ProgressFill.Size = UDim2.new(0, 0, 1, 0)
             end
@@ -2311,10 +2860,11 @@ task.spawn(function()
             end
 
             local newSub = string.format(
-                "Map Fruits: %d | Stored Session: %d | Speed: %d studs/s",
+                "Map: %d | Stored: %d | Pool: %d | DB: %d",
                 #fruits,
                 TotalSnipedSession,
-                Config.FlightSpeed
+                #CachedServerPool,
+                LearnedFruitCount
             )
             if newSub ~= lastHudSub then
                 lastHudSub = newSub
@@ -2327,24 +2877,36 @@ task.spawn(function()
                 HudWebhookLine.Text = newWh
             end
 
+            if LearnedFruitCount ~= lastLearnedCount then
+                lastLearnedCount = LearnedFruitCount
+                FingerprintDbParagraph:SetDesc(string.format(
+                    "Learned %d fruit 3D mesh fingerprints (auto-learns on pickup & visible tools).",
+                    LearnedFruitCount
+                ))
+            end
+
             local radarLines = {}
             if #fruits == 0 then
                 table.insert(radarLines, "• No fruits currently spawned in Workspace.")
             else
                 for i, f in ipairs(fruits) do
                     if i <= 8 then
-                        local kind = f.IsNatural and "[NATURAL SPAWN]" or "[DROPPED TOOL]"
+                        local kind = f.IsNatural and "[NATURAL]" or "[DROPPED]"
+                        local filterTag = (Config.OnlySnipeFiltered and not f.MatchesFilter) and "[SKIP]" or "[TARGET]"
                         table.insert(radarLines, string.format(
-                            "%d. %s %s (%s) — %d studs",
-                            i, kind, f.Meta and f.Meta.Display or f.Name, f.Rarity, f.Distance
+                            "%d. %s %s %s (%s) — %d studs",
+                            i, filterTag, kind, f.Meta and f.Meta.Display or f.Name, f.Rarity, f.Distance
                         ))
                     end
                 end
             end
-            table.insert(radarLines, string.format("\nSession Stored: %d | Flight: %s | Webhook: %s",
+            table.insert(radarLines, string.format(
+                "\nStored: %d | Flight: %s | Pool: %d | DB: %d | Turbo: %s",
                 TotalSnipedSession,
                 FlightState.Active and ("ACTIVE -> " .. FlightState.TargetLabel) or "IDLE",
-                WebhookStatus
+                #CachedServerPool,
+                LearnedFruitCount,
+                Config.TurboFastHop and "ON" or "OFF"
             ))
             local newRadarText = table.concat(radarLines, "\n")
             if newRadarText ~= lastRadarText then
@@ -2368,7 +2930,7 @@ task.spawn(function()
             end
         end)
 
-        task.wait(0.4)
+        task.wait(0.1)
     end
 end)
 
@@ -2402,8 +2964,8 @@ if typeof(STATE) == "table" and STATE.onCleanup then
 end
 
 WindUI:Notify({
-    Title = "Aegis Fruit Sniper v3.0 Loaded!",
-    Content = "Ultra-Lightweight Engine + Wiki Fruit Webhook Images Ready!",
+    Title = "Aegis Fruit Sniper v3.1 TURBO Loaded!",
+    Content = string.format("Pre-ID Natural Spawn DB (%d) + WindUI Disk Cache + Wiki Webhooks Ready!", LearnedFruitCount),
     Duration = 5,
     Icon = "radar",
 })
