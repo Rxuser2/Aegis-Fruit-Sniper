@@ -1393,29 +1393,24 @@ local function hopToNewServer()
                 saveServerHopCache()
                 TeleportFailedSignal = false
 
-                -- Method A: Blox Fruits Native __ServerBrowser teleport
-                pcall(function()
-                    local sb = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-                    if sb then
-                        task.spawn(function()
-                            pcall(function() sb:InvokeServer("teleport", chosen) end)
-                        end)
-                    end
-                end)
-
-                -- Method B: Direct TeleportService:TeleportToPlaceInstance
                 pcall(function()
                     TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
                 end)
 
-                -- Wait up to 3.5s, but abort early if TeleportInitFailed fires
+                -- Wait up to 10s for teleport transition; ONLY retry another server if TeleportInitFailed actually fires!
                 local waitStart = os.clock()
-                while (os.clock() - waitStart) < 3.5 do
-                    if TeleportFailedSignal then
+                while (os.clock() - waitStart) < 10 do
+                    if TeleportFailedSignal or not isScriptAlive() then
                         break
                     end
-                    task.wait(0.15)
+                    task.wait(0.2)
                 end
+
+                if not TeleportFailedSignal then
+                    -- Teleport is in progress without error; do NOT spam another TeleportToPlaceInstance mid-transition!
+                    break
+                end
+                task.wait(0.5)
             end
         end
 
