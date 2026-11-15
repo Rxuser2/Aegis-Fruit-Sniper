@@ -21,6 +21,8 @@ local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/Rxuser2/Aegis-Fruit-Sniper/main/GreatestFruitSniper.luau"
+local GITHUB_PAGES_URL = "https://rxuser2.github.io/Aegis-Fruit-Sniper/"
+local DEFAULT_WEB_SYNC_URL = "https://aegis-fruit-hub.rxuser2-aegis.workers.dev"
 local LOADSTRING_SNIPPET = 'loadstring(game:HttpGet("' .. GITHUB_RAW_URL .. '"))()'
 
 -- ============================================================================
@@ -120,6 +122,12 @@ local Config = {
     FruitESP = true,
     FruitTracers = true,
     ShowMiniHUD = true,
+
+    -- Web Dashboard & Cloud Sync (Cloudflare Worker + GitHub Pages)
+    WebSyncEnabled = true,
+    WebSyncUrl = DEFAULT_WEB_SYNC_URL,
+    WebAccessKey = "", -- Leave blank in repo; set in local config.json, WindUI 'Web Dashboard' tab, or getgenv().AEGIS_WEB_KEY
+    WebSyncInterval = 5,
 
     -- Discord Webhooks
     WebhookEnabled = true,
@@ -463,6 +471,24 @@ local LearnedFruitCount = 0
 local LastFingerprintSave = 0
 local PendingNaturalLearn = nil
 
+local WebHub = {
+    KnownGlobalVersion = 0,
+    KnownOverrideVersion = 0,
+    KnownFpTs = 0,
+    KnownFpTotal = -1,
+    CachedGlobalConfig = nil,
+    CachedOverrideConfig = nil,
+    PendingFingerprints = {},
+    PendingCatches = {},
+    BlockedJobIds = {},
+    LastSyncAt = 0,
+    IsSyncing = false,
+    Status = "Standby",
+    SyncCount = 0,
+    ImmediateRequested = false,
+    StopCleanupFn = nil,
+}
+
 local function recountLearnedFruits()
     table.clear(LearnedFruitIds)
     local cnt = 0
@@ -585,10 +611,12 @@ local function learnFingerprintKeys(keys, fruitId)
         local existing = FruitAssetMap[k]
         if existing == nil then
             FruitAssetMap[k] = fruitId
+            WebHub.PendingFingerprints[k] = fruitId
             updated = true
         elseif existing ~= fruitId and existing ~= "__SHARED__" then
             -- Auto-demote collisions (e.g. shared stem mesh across two fruits)
             FruitAssetMap[k] = "__SHARED__"
+            WebHub.PendingFingerprints[k] = "__SHARED__"
             updated = true
         end
     end
@@ -1389,6 +1417,7 @@ local function storeSingleFruitTool(tool)
     end
 
     -- Auto-learn fingerprint immediately from the physical Tool & any recently picked-up natural spawn!
+    local catchSource = "Dropped/Gacha"
     if FruitMetaById[origName] then
         learnFruitFingerprint(tool, origName)
         if PendingNaturalLearn and (os.clock() - PendingNaturalLearn.RemovedAt) <= 4.0 then
@@ -1396,6 +1425,7 @@ local function storeSingleFruitTool(tool)
             if not hrp or (hrp.Position - PendingNaturalLearn.Pos).Magnitude <= 90 then
                 learnFingerprintKeys(PendingNaturalLearn.Keys, origName)
                 PendingNaturalLearn = nil
+                catchSource = "Natural"
             end
         end
     end
@@ -1432,6 +1462,17 @@ local function storeSingleFruitTool(tool)
             if ok and res == true then
                 StoredToolCache[tool] = "STORED"
                 TotalSnipedSession = TotalSnipedSession + 1
+                table.insert(WebHub.PendingCatches, {
+                    catchUid = string.format("%s:%s:%d:%d", tostring(LocalPlayer.UserId), origName, os.time(), TotalSnipedSession),
+                    fruitId = origName,
+                    displayName = meta and meta.Display or tool.Name,
+                    rarity = meta and meta.Rarity or "Unknown",
+                    iconUrl = iconUrl,
+                    jobId = tostring(game.JobId),
+                    source = catchSource,
+                    ts = os.time() * 1000,
+                })
+                WebHub.ImmediateRequested = true
                 if Config.NotifyOnStore then
                     sendDiscordWebhook(
                         "✅ Fruit Sniped & Stored!",
@@ -1447,6 +1488,17 @@ local function storeSingleFruitTool(tool)
                 end
             elseif ok and typeof(res) == "number" then
                 StoredToolCache[tool] = "FULL"
+                table.insert(WebHub.PendingCatches, {
+                    catchUid = string.format("%s:%s:%d:full", tostring(LocalPlayer.UserId), origName, os.time()),
+                    fruitId = origName,
+                    displayName = meta and meta.Display or tool.Name,
+                    rarity = meta and meta.Rarity or "Unknown",
+                    iconUrl = iconUrl,
+                    jobId = tostring(game.JobId),
+                    source = catchSource .. " (Full)",
+                    ts = os.time() * 1000,
+                })
+                WebHub.ImmediateRequested = true
                 if Config.NotifyOnStore then
                     sendDiscordWebhook(
                         "⚠️ Fruit Picked Up (Storage Full!)",
@@ -1807,7 +1859,7 @@ local function hopToNewServer()
         local nowUnix = os.time()
         for _, jid in ipairs(CachedServerPool) do
             local vTs = VisitedServers[jid]
-            if jid ~= currentJobId and (not vTs or (nowUnix - vTs) >= VISITED_TTL) then
+            if jid ~= currentJobId and not WebHub.BlockedJobIds[jid] and (not vTs or (nowUnix - vTs) >= VISITED_TTL) then
                 table.insert(cleanPool, jid)
             end
         end
@@ -1831,7 +1883,14 @@ local function hopToNewServer()
             end
 
             local chosen = table.remove(CachedServerPool, 1)
-            if chosen and chosen ~= currentJobId and not VisitedServers[chosen] then
+            if chosen and chosen ~= currentJobId and not VisitedServers[chosen] and not WebHub.BlockedJobIds[chosen] then
+                if WebHub.claimServer and Config.WebSyncEnabled and WebHub.getKey and WebHub.getKey() ~= "" then
+                    local okClaim = WebHub.claimServer(chosen, currentJobId)
+                    if not okClaim then
+                        WebHub.BlockedJobIds[chosen] = true
+                        continue
+                    end
+                end
                 VisitedServers[chosen] = os.time()
                 saveServerHopCache()
                 TeleportFailedSignal = false
@@ -1990,7 +2049,7 @@ HudTitle.Font = Enum.Font.GothamBold
 HudTitle.TextSize = 13
 HudTitle.TextXAlignment = Enum.TextXAlignment.Left
 HudTitle.TextColor3 = Color3.fromHex("#00F5A0")
-HudTitle.Text = "⚡ AEGIS FRUIT SNIPER v3.1 • TURBO RADAR"
+HudTitle.Text = "⚡ AEGIS FRUIT SNIPER v3.2 • CLOUD HUB"
 HudTitle.Parent = HudCard
 
 local HudStatusLine = Instance.new("TextLabel")
@@ -2108,9 +2167,9 @@ pcall(function()
 end)
 
 local Window = WindUI:CreateWindow({
-    Title = "AEGIS FRUIT SNIPER • v3.1",
+    Title = "AEGIS FRUIT SNIPER • v3.2",
     Icon = "radar",
-    Author = "Turbo Scan/Hop • Pre-ID Natural Spawns • Wiki Icons",
+    Author = "Cloud Hub + Pre-ID Natural Spawns + Turbo Hop",
     Folder = "AegisFruitSniper",
     Size = UDim2.fromOffset(630, 480),
     MinSize = Vector2.new(560, 380),
@@ -2130,7 +2189,7 @@ local Window = WindUI:CreateWindow({
         ButtonsType = "Mac",
     },
     OpenButton = {
-        Title = "Aegis v3.1",
+        Title = "Aegis v3.2",
         Icon = "radar",
         CornerRadius = UDim.new(0, 14),
         StrokeThickness = 2,
@@ -2150,7 +2209,7 @@ local Window = WindUI:CreateWindow({
 
 pcall(function()
     Window:Tag({
-        Title = "v3.1 TURBO",
+        Title = "v3.2 CLOUD HUB",
         Color = Color3.fromHex("#00F5A0"),
     })
     Window:Tag({
@@ -2167,6 +2226,7 @@ local TabFilter  = Window:Tab({ Title = "Fruit Filter", Icon = "sparkles" })
 local TabDealer  = Window:Tab({ Title = "Dealer & Gacha", Icon = "shopping-bag" })
 local TabFlight  = Window:Tab({ Title = "Flight & Server Hop", Icon = "plane" })
 local TabWebhook = Window:Tab({ Title = "ESP & Webhooks", Icon = "bell" })
+local TabWeb     = Window:Tab({ Title = "Web Dashboard", Icon = "globe" })
 
 -- ---- TAB 1: LIVE RADAR & SNIPE ----
 local LiveRadarParagraph = TabRadar:Paragraph({
@@ -2667,6 +2727,66 @@ TabWebhook:Input({
     end,
 })
 
+-- ---- TAB 6: WEB DASHBOARD & CLOUDFLARE SYNC ----
+local WebStatusParagraph = TabWeb:Paragraph({
+    Title = "🌐 Cloudflare Hub + GitHub Pages Sync",
+    Desc = "Enter your Access Key to connect this instance to the Web Dashboard.",
+})
+
+TabWeb:Section({ Title = "Cloud Sync Configuration" })
+
+TabWeb:Toggle({
+    Title = "Enable Live Web Dashboard Sync",
+    Desc = "Streams live status, shares learned 3D fingerprints across accounts, coordinates anti-duplicate servers, and accepts remote Config edits.",
+    Icon = "globe",
+    Value = Config.WebSyncEnabled,
+    Callback = function(state)
+        Config.WebSyncEnabled = state
+        saveConfig()
+    end,
+})
+
+TabWeb:Input({
+    Title = "Cloudflare Worker API URL",
+    Desc = "Default points to your deployed Aegis Fruit Hub Worker.",
+    Value = Config.WebSyncUrl,
+    Placeholder = DEFAULT_WEB_SYNC_URL,
+    Callback = function(val)
+        if type(val) == "string" and val ~= "" then
+            Config.WebSyncUrl = val:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+            saveConfig()
+        end
+    end,
+})
+
+TabWeb:Input({
+    Title = "Dashboard Access Key (Secret PIN)",
+    Desc = "Must match AEGIS_ACCESS_KEY on your Cloudflare Worker (never stored on GitHub).",
+    Value = Config.WebAccessKey,
+    Placeholder = "aegis_...",
+    Callback = function(val)
+        if type(val) == "string" then
+            Config.WebAccessKey = val:gsub("^%s+", ""):gsub("%s+$", "")
+            saveConfig()
+        end
+    end,
+})
+
+TabWeb:Slider({
+    Title = "Web Sync Interval (seconds)",
+    Desc = "How often this instance sends telemetry & polls remote commands/config (5s recommended for multi-account free tier).",
+    Value = {
+        Min = 2,
+        Max = 30,
+        Default = math.clamp(tonumber(Config.WebSyncInterval) or 5, 2, 30),
+    },
+    Step = 1,
+    Callback = function(val)
+        Config.WebSyncInterval = tonumber(val) or 5
+        saveConfig()
+    end,
+})
+
 HudCard.Visible = Config.ShowMiniHUD
 IsInitializingUI = false
 saveConfig(true)
@@ -2683,7 +2803,7 @@ TabWebhook:Button({
         local thumbUrl = (eqMeta and eqMeta.Icon) or DEFAULT_FRUIT_ICON
 
         sendDiscordWebhook(
-            "🟢 Aegis Fruit Sniper v3.1 TURBO — Wiki Image Webhook Verified!",
+            "🟢 Aegis Fruit Sniper v3.2 — Wiki Image + Cloud Hub Verified!",
             string.format(
                 "Dual Webhook + **Blox Fruits Wiki Fruit Thumbnails** are online!\nCurrently tracking **%d** fruit(s) in `Workspace`.\nFeatured Icon: **%s**",
                 #list,
@@ -2706,6 +2826,444 @@ TabWebhook:Button({
 })
 
 -- ============================================================================
+-- 11B. CLOUDFLARE WEB HUB ENGINE (Multi-Instance Sync, Locks & Commands)
+-- ============================================================================
+function WebHub.getBaseUrl()
+    local u = type(Config.WebSyncUrl) == "string" and Config.WebSyncUrl ~= "" and Config.WebSyncUrl or DEFAULT_WEB_SYNC_URL
+    return (u:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", ""))
+end
+
+function WebHub.getKey()
+    if type(Config.WebAccessKey) == "string" and Config.WebAccessKey ~= "" then
+        return Config.WebAccessKey
+    end
+    if type(genv.AEGIS_WEB_KEY) == "string" and genv.AEGIS_WEB_KEY ~= "" then
+        return genv.AEGIS_WEB_KEY
+    end
+    return ""
+end
+
+local WEB_LOCAL_ONLY_KEYS = {
+    WebSyncEnabled = true,
+    WebSyncUrl = true,
+    WebAccessKey = true,
+    WebhookPrimary = true,
+    WebhookBackup = true,
+}
+
+function WebHub.buildSanitizedConfig()
+    local out = {}
+    for k, v in pairs(Config) do
+        if not WEB_LOCAL_ONLY_KEYS[k] then
+            if type(v) == "table" then
+                local copy = {}
+                for subK, subV in pairs(v) do
+                    if subV == true then
+                        copy[subK] = true
+                    end
+                end
+                out[k] = copy
+            else
+                out[k] = v
+            end
+        end
+    end
+    return out
+end
+
+function WebHub.applyConfigLayer(layer)
+    if type(layer) ~= "table" then return false end
+    local changed = false
+    for k, v in pairs(layer) do
+        if not WEB_LOCAL_ONLY_KEYS[k] and Config[k] ~= nil then
+            if type(Config[k]) == "table" and type(v) == "table" then
+                local nextMap = {}
+                for subK, subV in pairs(v) do
+                    if type(subK) == "string" then
+                        nextMap[subK] = (subV == true)
+                    elseif type(subK) == "number" and type(subV) == "string" then
+                        nextMap[subV] = true
+                    end
+                end
+                Config[k] = nextMap
+                changed = true
+            elseif type(v) == type(Config[k]) then
+                if Config[k] ~= v then
+                    Config[k] = v
+                    changed = true
+                end
+            end
+        end
+    end
+    return changed
+end
+
+function WebHub.applyMergedRemoteConfig()
+    local changed = false
+    if type(WebHub.CachedGlobalConfig) == "table" then
+        if WebHub.applyConfigLayer(WebHub.CachedGlobalConfig) then
+            changed = true
+        end
+    end
+    if type(WebHub.CachedOverrideConfig) == "table" then
+        if WebHub.applyConfigLayer(WebHub.CachedOverrideConfig) then
+            changed = true
+        end
+    end
+    if changed then
+        HudCard.Visible = Config.ShowMiniHUD
+        if not Config.AutoSnipeMap and FlightState.Active then
+            stopFlight()
+        end
+        if Config.AutoStoreFruits then
+            storeAllCurrentFruitTools()
+        end
+        rebuildSortedMapFruits()
+        saveConfig(true)
+        pcall(function()
+            WindUI:Notify({
+                Title = "🌐 Config Updated from Web",
+                Content = string.format("Applied cloud config (Global v%d / Override v%d)", WebHub.KnownGlobalVersion, WebHub.KnownOverrideVersion),
+                Duration = 3,
+                Icon = "globe",
+            })
+        end)
+    end
+end
+
+function WebHub.executeCommands(commands)
+    if type(commands) ~= "table" then return end
+    for _, cmd in ipairs(commands) do
+        if type(cmd) == "table" and type(cmd.action) == "string" then
+            local act = cmd.action
+            local pl = type(cmd.payload) == "table" and cmd.payload or {}
+            if act == "force_hop" then
+                EmptyMapSince = nil
+                task.spawn(hopToNewServer)
+            elseif act == "rescan" then
+                task.spawn(function()
+                    fullRescanWorkspace()
+                    if Config.AutoStoreFruits then
+                        storeAllCurrentFruitTools()
+                    end
+                end)
+            elseif act == "roll_gacha" then
+                task.spawn(rollCousinGacha)
+            elseif act == "store_now" then
+                task.spawn(storeAllCurrentFruitTools)
+            elseif act == "join_server" then
+                local pid = tonumber(pl.placeId) or game.PlaceId
+                local jid = tostring(pl.jobId or "")
+                if jid ~= "" and jid ~= tostring(game.JobId) and not IsHopping then
+                    IsHopping = true
+                    stopFlight()
+                    clearAllEsp()
+                    VisitedServers[tostring(game.JobId)] = os.time()
+                    saveConfig(true)
+                    saveServerHopCache()
+                    armTeleportAutoExecute()
+                    task.spawn(function()
+                        local ok = pcall(function()
+                            TeleportService:TeleportToPlaceInstance(pid, jid, LocalPlayer)
+                        end)
+                        if not ok then
+                            IsHopping = false
+                        end
+                    end)
+                end
+            elseif act == "set_team" and type(pl.team) == "string" then
+                Config.AutoJoinTeam = pl.team
+                saveConfig(true)
+                if pl.team ~= "Disabled" then
+                    task.spawn(function()
+                        pcall(function()
+                            local commF = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+                            if commF then
+                                commF:InvokeServer("SetTeam", pl.team)
+                            end
+                        end)
+                    end)
+                end
+            elseif act == "remote_stop" then
+                task.defer(function()
+                    if WebHub.StopCleanupFn then
+                        WebHub.StopCleanupFn()
+                    elseif genv.__AegisFruitSniperCleanup then
+                        genv.__AegisFruitSniperCleanup()
+                    end
+                end)
+            end
+        end
+    end
+end
+
+function WebHub.claimServer(jobId, oldJobId)
+    local key = WebHub.getKey()
+    if not httpRequestFn or key == "" then return true end
+    local ok, resp = pcall(httpRequestFn, {
+        Url = WebHub.getBaseUrl() .. "/api/claim-server",
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["X-Aegis-Key"] = key,
+        },
+        Body = HttpService:JSONEncode({
+            instanceKey = tostring(LocalPlayer.UserId),
+            playerName = LocalPlayer.Name,
+            placeId = game.PlaceId,
+            jobId = tostring(jobId),
+            oldJobId = tostring(oldJobId or ""),
+        }),
+    })
+    if not ok or not resp or tonumber(resp.StatusCode) ~= 200 then
+        return true -- Do not stall hopping on transient network errors
+    end
+    local parsedOk, data = pcall(function()
+        return HttpService:JSONDecode(resp.Body)
+    end)
+    if parsedOk and type(data) == "table" and data.ok == false then
+        return false
+    end
+    return true
+end
+
+function WebHub.syncNow(force, liveStatusText)
+    if WebHub.IsSyncing or not httpRequestFn then return end
+    local key = WebHub.getKey()
+    if key == "" then
+        WebHub.Status = "Missing Access Key (set in Tab)"
+        return
+    end
+
+    WebHub.IsSyncing = true
+    WebHub.LastSyncAt = os.clock()
+    WebHub.ImmediateRequested = false
+
+    task.spawn(function()
+        pcall(function()
+            local lpData = LocalPlayer:FindFirstChild("Data")
+            local level = lpData and lpData:FindFirstChild("Level") and tonumber(lpData.Level.Value) or 0
+            local beli = lpData and lpData:FindFirstChild("Beli") and tonumber(lpData.Beli.Value) or 0
+            local df = lpData and lpData:FindFirstChild("DevilFruit") and tostring(lpData.DevilFruit.Value) or "None"
+            if df == "" then df = "None" end
+
+            local mapFruitsSummary = {}
+            for i, f in ipairs(MapFruits) do
+                if i <= 10 then
+                    table.insert(mapFruitsSummary, {
+                        name = f.Name,
+                        display = (f.Meta and f.Meta.Display) or f.Name,
+                        rarity = f.Rarity or "Unknown",
+                        distance = f.Distance or 0,
+                        isNatural = f.IsNatural == true,
+                        matchesFilter = f.MatchesFilter == true,
+                        icon = (f.Meta and f.Meta.Icon) or DEFAULT_FRUIT_ICON,
+                    })
+                end
+            end
+
+            local dealerSummary = {}
+            for i, d in ipairs(DealerOnSaleList) do
+                if i <= 20 then
+                    table.insert(dealerSummary, {
+                        name = d.Name,
+                        rarity = d.Rarity or "Unknown",
+                        price = d.Price or 0,
+                        icon = d.Icon or DEFAULT_FRUIT_ICON,
+                    })
+                end
+            end
+
+            -- Snapshot pending fingerprints; if remote DB is empty, seed local fingerprints once
+            local uploadFps = {}
+            local uploadCount = 0
+            for k, v in pairs(WebHub.PendingFingerprints) do
+                uploadFps[k] = v
+                uploadCount = uploadCount + 1
+            end
+            if WebHub.KnownFpTotal == 0 and uploadCount == 0 then
+                for k, v in pairs(FruitAssetMap) do
+                    if type(k) == "string" and type(v) == "string" and v ~= "" then
+                        uploadFps[k] = v
+                        uploadCount = uploadCount + 1
+                    end
+                end
+            end
+
+            local uploadCatches = {}
+            for _, c in ipairs(WebHub.PendingCatches) do
+                table.insert(uploadCatches, c)
+            end
+
+            local payload = {
+                instanceKey = tostring(LocalPlayer.UserId),
+                userId = tostring(LocalPlayer.UserId),
+                playerName = LocalPlayer.Name,
+                displayName = LocalPlayer.DisplayName,
+                level = level,
+                beli = beli,
+                equippedFruit = df,
+                placeId = game.PlaceId,
+                jobId = tostring(game.JobId),
+                playersCount = #Players:GetPlayers(),
+                maxPlayers = Players.MaxPlayers,
+                status = tostring(liveStatusText or WebHub.LastStatusLabel or "IDLE"),
+                flightTarget = FlightState.Active and tostring(FlightState.TargetLabel or "") or "",
+                mapFruits = mapFruitsSummary,
+                dealerStock = dealerSummary,
+                storedSession = TotalSnipedSession,
+                poolCount = #CachedServerPool,
+                learnedCount = LearnedFruitCount,
+                webhookSent = WebhookSentCount,
+                turboMode = Config.TurboFastHop == true,
+                activeConfig = WebHub.buildSanitizedConfig(),
+                knownGlobalVersion = WebHub.KnownGlobalVersion,
+                knownOverrideVersion = WebHub.KnownOverrideVersion,
+                knownFpTs = WebHub.KnownFpTs,
+                knownFpTotal = WebHub.KnownFpTotal,
+                newFingerprints = uploadCount > 0 and uploadFps or {},
+                catches = uploadCatches,
+            }
+
+            local ok, resp = pcall(httpRequestFn, {
+                Url = WebHub.getBaseUrl() .. "/api/sync",
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                    ["X-Aegis-Key"] = key,
+                },
+                Body = HttpService:JSONEncode(payload),
+            })
+
+            if not ok or not resp then
+                WebHub.Status = "Network Error"
+                return
+            end
+
+            local code = tonumber(resp.StatusCode) or 0
+            if code == 401 then
+                WebHub.Status = "Auth Failed (Check Access Key)"
+                return
+            elseif code < 200 or code >= 300 then
+                WebHub.Status = "HTTP Error " .. tostring(code)
+                return
+            end
+
+            local decOk, data = pcall(function()
+                return HttpService:JSONDecode(resp.Body)
+            end)
+            if not decOk or type(data) ~= "table" or not data.ok then
+                WebHub.Status = "Invalid JSON Response"
+                return
+            end
+
+            -- Clear successfully transmitted buffers
+            for k in pairs(uploadFps) do
+                if WebHub.PendingFingerprints[k] == uploadFps[k] then
+                    WebHub.PendingFingerprints[k] = nil
+                end
+            end
+            for _ = 1, #uploadCatches do
+                table.remove(WebHub.PendingCatches, 1)
+            end
+
+            WebHub.SyncCount = WebHub.SyncCount + 1
+            WebHub.Status = string.format("Connected (#%d)", WebHub.SyncCount)
+
+            if type(data.blockedJobIds) == "table" then
+                local nextBlocked = {}
+                for _, jid in ipairs(data.blockedJobIds) do
+                    if type(jid) == "string" and jid ~= "" then
+                        nextBlocked[jid] = true
+                    end
+                end
+                WebHub.BlockedJobIds = nextBlocked
+            end
+
+            if type(data.globalFingerprints) == "table" then
+                local mergedFp = false
+                for ak, fid in pairs(data.globalFingerprints) do
+                    if type(ak) == "string" and type(fid) == "string" and (fid == "__SHARED__" or FruitMetaById[fid]) then
+                        if FruitAssetMap[ak] ~= fid then
+                            FruitAssetMap[ak] = fid
+                            mergedFp = true
+                        end
+                    end
+                end
+                if mergedFp then
+                    saveFruitFingerprints(true)
+                    rebuildSortedMapFruits()
+                else
+                    recountLearnedFruits()
+                end
+            end
+            if tonumber(data.fpMaxTs) then WebHub.KnownFpTs = tonumber(data.fpMaxTs) end
+            if tonumber(data.fpTotal) then WebHub.KnownFpTotal = tonumber(data.fpTotal) end
+
+            local cfgDirty = false
+            local gVer = tonumber(data.globalConfigVersion) or 0
+            if gVer ~= WebHub.KnownGlobalVersion then
+                WebHub.KnownGlobalVersion = gVer
+                if type(data.globalConfig) == "table" then
+                    WebHub.CachedGlobalConfig = data.globalConfig
+                end
+                cfgDirty = true
+            end
+
+            local oVer = tonumber(data.overrideVersion) or 0
+            if oVer ~= WebHub.KnownOverrideVersion then
+                WebHub.KnownOverrideVersion = oVer
+                if type(data.overrideConfig) == "table" then
+                    WebHub.CachedOverrideConfig = data.overrideConfig
+                end
+                cfgDirty = true
+            end
+
+            if cfgDirty then
+                WebHub.applyMergedRemoteConfig()
+            end
+
+            if type(data.commands) == "table" and #data.commands > 0 then
+                WebHub.executeCommands(data.commands)
+            end
+        end)
+        WebHub.IsSyncing = false
+    end)
+end
+
+TabWeb:Button({
+    Title = "🔄 Sync With Web Dashboard Now",
+    Desc = "Immediately pushes telemetry, syncs shared fingerprints, and checks remote commands.",
+    Icon = "refresh-cw",
+    Callback = function()
+        WebHub.syncNow(true, WebHub.LastStatusLabel or "Manual Sync")
+        WindUI:Notify({
+            Title = "Web Sync Triggered",
+            Content = "Status: " .. tostring(WebHub.Status),
+            Duration = 3,
+            Icon = "globe",
+        })
+    end,
+})
+
+TabWeb:Button({
+    Title = "📋 Copy GitHub Pages Dashboard URL",
+    Desc = GITHUB_PAGES_URL,
+    Icon = "copy",
+    Callback = function()
+        if setclipboard then
+            pcall(setclipboard, GITHUB_PAGES_URL)
+        end
+        WindUI:Notify({
+            Title = "Dashboard URL Copied!",
+            Content = GITHUB_PAGES_URL,
+            Duration = 3,
+            Icon = "check",
+        })
+    end,
+})
+
+-- ============================================================================
 -- 12. ULTRA-LIGHTWEIGHT MASTER ORCHESTRATOR LOOP (Turbo 0.1s Tick)
 -- ============================================================================
 task.spawn(function()
@@ -2716,6 +3274,10 @@ task.spawn(function()
     task.spawn(function()
         refreshDealerStock(false)
     end)
+
+    if Config.WebSyncEnabled then
+        WebHub.syncNow(true, "Starting Up...")
+    end
 
     local lastFullRescan = os.clock()
     local lastToolLearnScan = os.clock()
@@ -2728,6 +3290,7 @@ task.spawn(function()
     local lastHudStatus = ""
     local lastHudSub = ""
     local lastHudWebhook = ""
+    local lastWebText = ""
 
     while isScriptAlive() do
         local now = os.clock()
@@ -2857,6 +3420,7 @@ task.spawn(function()
             if newStatus ~= lastHudStatus then
                 lastHudStatus = newStatus
                 HudStatusLine.Text = newStatus
+                WebHub.LastStatusLabel = newStatus
             end
 
             local newSub = string.format(
@@ -2900,13 +3464,27 @@ task.spawn(function()
                     end
                 end
             end
+            local blockedCount = 0
+            for _ in pairs(WebHub.BlockedJobIds) do blockedCount = blockedCount + 1 end
+            local newWebDesc = string.format(
+                "Status: %s | Alt Locks: %d | Config Global v%d / Override v%d",
+                Config.WebSyncEnabled and WebHub.Status or "Disabled",
+                blockedCount,
+                WebHub.KnownGlobalVersion,
+                WebHub.KnownOverrideVersion
+            )
+            if newWebDesc ~= lastWebText then
+                lastWebText = newWebDesc
+                WebStatusParagraph:SetDesc(newWebDesc)
+            end
+
             table.insert(radarLines, string.format(
-                "\nStored: %d | Flight: %s | Pool: %d | DB: %d | Turbo: %s",
+                "\nStored: %d | Flight: %s | Pool: %d | DB: %d | Hub: %s",
                 TotalSnipedSession,
                 FlightState.Active and ("ACTIVE -> " .. FlightState.TargetLabel) or "IDLE",
                 #CachedServerPool,
                 LearnedFruitCount,
-                Config.TurboFastHop and "ON" or "OFF"
+                Config.WebSyncEnabled and WebHub.Status or "OFF"
             ))
             local newRadarText = table.concat(radarLines, "\n")
             if newRadarText ~= lastRadarText then
@@ -2929,6 +3507,15 @@ task.spawn(function()
                 DealerStockParagraph:SetDesc(newDealerText)
             end
         end)
+
+        -- 6. Asynchronous Cloud Web Hub Sync (Dirty-checked & Non-blocking)
+        if Config.WebSyncEnabled then
+            local interval = math.clamp(tonumber(Config.WebSyncInterval) or 5, 2, 30)
+            local minGap = WebHub.ImmediateRequested and 0.8 or interval
+            if (now - WebHub.LastSyncAt) >= minGap then
+                WebHub.syncNow(false, lastHudStatus)
+            end
+        end
 
         task.wait(0.1)
     end
@@ -2958,14 +3545,15 @@ local function fullCleanup()
     end)
 end
 
+WebHub.StopCleanupFn = fullCleanup
 genv.__AegisFruitSniperCleanup = fullCleanup
 if typeof(STATE) == "table" and STATE.onCleanup then
     STATE.onCleanup(fullCleanup)
 end
 
 WindUI:Notify({
-    Title = "Aegis Fruit Sniper v3.1 TURBO Loaded!",
-    Content = string.format("Pre-ID Natural Spawn DB (%d) + WindUI Disk Cache + Wiki Webhooks Ready!", LearnedFruitCount),
+    Title = "Aegis Fruit Sniper v3.2 CLOUD HUB Loaded!",
+    Content = string.format("Cloud Sync + Pre-ID DB (%d) + Turbo Hop + Wiki Webhooks Ready!", LearnedFruitCount),
     Duration = 5,
     Icon = "radar",
 })
