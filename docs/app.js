@@ -199,9 +199,40 @@ function escapeHtml(val) {
 function toast(msg, isErr = false) {
   const box = document.createElement("div");
   box.className = "toast" + (isErr ? " err" : "");
-  box.textContent = msg;
+  const icon = document.createElement("span");
+  icon.className = "toast-icon";
+  icon.textContent = isErr ? "⚠️" : "✅";
+  const text = document.createElement("span");
+  text.textContent = msg;
+  box.append(icon, text);
   $("toast-container").appendChild(box);
-  setTimeout(() => box.remove(), 3400);
+  setTimeout(() => {
+    box.classList.add("leaving");
+    setTimeout(() => box.remove(), 260);
+  }, 3200);
+}
+
+// Smooth number count-up for KPI values (skips animation when reduced motion is requested)
+const kpiLast = {};
+function setKpiNumber(id, value, formatter = formatNumber) {
+  const el = $(id);
+  if (!el) return;
+  const target = Number(value) || 0;
+  const from = kpiLast[id] ?? target;
+  kpiLast[id] = target;
+  if (from === target || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    el.textContent = formatter(target);
+    return;
+  }
+  const start = performance.now();
+  const dur = 600;
+  const step = (now) => {
+    const t = Math.min(1, (now - start) / dur);
+    const eased = 1 - Math.pow(1 - t, 3);
+    el.textContent = formatter(Math.round(from + (target - from) * eased));
+    if (t < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 function formatNumber(n) {
@@ -330,10 +361,15 @@ function renderAll(forceConfigSync) {
   $("badge-online").textContent = String(onlineList.length);
   $("kpi-online").textContent = `${onlineList.length} / ${instances.length}`;
   $("kpi-in-flight").textContent = `${flyingCount} sedang terbang`;
-  $("kpi-stored").textContent = formatNumber(totalStored);
+  setKpiNumber("kpi-stored", totalStored);
   $("kpi-catches").textContent = `${(d.catchHistory || []).length} log terbaru di cloud`;
-  $("kpi-fp").textContent = formatNumber(d.fingerprintsTotal || 0);
-  $("kpi-locks").textContent = formatNumber((d.serverLocks || []).length);
+  setKpiNumber("kpi-fp", d.fingerprintsTotal || 0);
+  setKpiNumber("kpi-locks", (d.serverLocks || []).length);
+  const onlinePct = instances.length ? Math.round((onlineList.length / instances.length) * 100) : 0;
+  const bar = $("kpi-online-bar");
+  if (bar) bar.style.width = `${onlinePct}%`;
+  const updated = $("last-updated");
+  if (updated) updated.textContent = `Update terakhir ${new Date().toLocaleTimeString("id-ID")}`;
 
   renderInstances(instances, d.serverTime);
   syncTargetSelector(instances);
@@ -348,7 +384,8 @@ function renderInstances(instances, serverTime) {
   const grid = $("instances-grid");
   if (!instances.length) {
     grid.innerHTML = `
-      <div class="glass" style="padding: 28px; grid-column: 1 / -1; text-align: center;">
+      <div class="empty-state glass">
+        <div class="empty-orb">🍏</div>
         <h3>Belum Ada Instance Terhubung</h3>
         <p class="muted small">Jalankan <code>GreatestFruitSniper.luau</code> di executor Roblox Anda dengan Access Key yang sama, maka instance akan muncul otomatis di sini dalam beberapa detik.</p>
       </div>`;
@@ -367,7 +404,7 @@ function renderInstances(instances, serverTime) {
             .map((f) => {
               const skipped = !f.matchesFilter && inst.activeConfig?.OnlySnipeFiltered;
               return `
-              <div class="fruit-row ${skipped ? "skipped" : ""}">
+              <div class="fruit-row r-${escapeHtml(f.rarity || "Unknown")} ${skipped ? "skipped" : ""}">
                 <div class="fruit-left">
                   <img class="fruit-icon" src="${escapeHtml(f.icon || DEFAULT_ICON)}" alt="" onerror="this.src='${DEFAULT_ICON}'" />
                   <div>
@@ -383,18 +420,23 @@ function renderInstances(instances, serverTime) {
 
       const hasOverride = Object.keys(inst.overrideConfig || {}).length > 0;
 
+      const initial = escapeHtml((inst.playerName || "?").trim().charAt(0).toUpperCase() || "?");
+      const flying = inst.online && inst.flightTarget;
       return `
-      <article class="inst-card glass ${inst.online ? "online" : "offline"}">
+      <article class="inst-card glass ${inst.online ? "online" : "offline"} ${flying ? "flying" : ""}">
         <div class="inst-top">
-          <div>
-            <div class="inst-name">${escapeHtml(inst.playerName)} ${hasOverride ? '<span class="tiny cyan">[Override]</span>' : ""}</div>
-            <div class="tiny muted">Lv.${formatNumber(inst.level)} • $${formatNumber(inst.beli)} Beli • Fruit: ${escapeHtml(inst.equippedFruit || "None")}</div>
+          <div class="inst-id">
+            <div class="avatar">${initial}<span class="avatar-dot"></span></div>
+            <div>
+              <div class="inst-name">${escapeHtml(inst.playerName)} ${hasOverride ? '<span class="tag-override">Override</span>' : ""}</div>
+              <div class="tiny muted">Lv.${formatNumber(inst.level)} • $${formatNumber(inst.beli)} Beli • Fruit: ${escapeHtml(inst.equippedFruit || "None")}</div>
+            </div>
           </div>
           <span class="status-pill ${inst.online ? "online" : "offline"}">${inst.online ? "ONLINE" : "OFFLINE"} • ${age}</span>
         </div>
 
         <div class="inst-live-box">
-          <div style="font-weight: 600;">${escapeHtml(inst.status || "IDLE")}</div>
+          <div class="live-status">${flying ? "🚀 " : ""}${escapeHtml(inst.status || "IDLE")}</div>
           <div class="tiny muted" style="margin-top: 4px;">
             ${escapeHtml(seaLabel)} • Players: ${inst.playersCount}/${inst.maxPlayers} • JobId: <code class="mono">${escapeHtml(shortJob)}</code>
           </div>
@@ -485,7 +527,8 @@ function renderConfigEditor() {
         ([key, label]) => `
         <label class="toggle-item">
           <span>${escapeHtml(label)}</span>
-          <input type="checkbox" data-cfg-bool="${key}" ${cfg[key] ? "checked" : ""} />
+          <input type="checkbox" class="switch-input" data-cfg-bool="${key}" ${cfg[key] ? "checked" : ""} />
+          <span class="switch" aria-hidden="true"></span>
         </label>`
       )
       .join("");

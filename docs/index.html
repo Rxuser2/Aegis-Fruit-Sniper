@@ -3,13 +3,16 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#060a12" />
   <title>Aegis Fruit Sniper v3.2 — Cloud Control Hub</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
+  <div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
   <div id="toast-container" aria-live="polite"></div>
 
   <!-- LOGIN GATE -->
@@ -66,23 +69,24 @@
     <main class="container">
       <!-- KPI ROW -->
       <section class="kpi-grid">
-        <div class="kpi-card glass">
-          <div class="kpi-label">Instance Online</div>
+        <div class="kpi-card glass accent-emerald">
+          <div class="kpi-head"><div class="kpi-label">Instance Online</div><span class="kpi-icon">🖥️</span></div>
           <div class="kpi-val" id="kpi-online">0 / 0</div>
+          <div class="kpi-bar"><span id="kpi-online-bar"></span></div>
           <div class="kpi-sub" id="kpi-in-flight">0 sedang terbang</div>
         </div>
-        <div class="kpi-card glass">
-          <div class="kpi-label">Total Stored (Session)</div>
+        <div class="kpi-card glass accent-green">
+          <div class="kpi-head"><div class="kpi-label">Total Stored (Session)</div><span class="kpi-icon">📦</span></div>
           <div class="kpi-val emerald" id="kpi-stored">0</div>
           <div class="kpi-sub" id="kpi-catches">0 tercatat di cloud</div>
         </div>
-        <div class="kpi-card glass">
-          <div class="kpi-label">Shared Natural DB</div>
+        <div class="kpi-card glass accent-cyan">
+          <div class="kpi-head"><div class="kpi-label">Shared Natural DB</div><span class="kpi-icon">🧬</span></div>
           <div class="kpi-val cyan" id="kpi-fp">0</div>
           <div class="kpi-sub">3D mesh sinkron lintas akun</div>
         </div>
-        <div class="kpi-card glass">
-          <div class="kpi-label">Global Server Locks</div>
+        <div class="kpi-card glass accent-amber">
+          <div class="kpi-head"><div class="kpi-label">Global Server Locks</div><span class="kpi-icon">🔒</span></div>
           <div class="kpi-val amber" id="kpi-locks">0</div>
           <div class="kpi-sub">Anti-bentrok JobId aktif</div>
         </div>
@@ -237,6 +241,10 @@
         </div>
       </section>
     </main>
+    <footer class="app-footer tiny muted">
+      <span id="last-updated">Menunggu data...</span>
+      <span>Aegis Fruit Sniper v3.2 • Cloudflare Workers + GitHub Pages</span>
+    </footer>
   </div>
 
   <!-- MODAL BACKUP SNIPE / SEND ALT -->
