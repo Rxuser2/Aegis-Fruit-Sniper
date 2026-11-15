@@ -7,7 +7,10 @@
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Rxuser2/Aegis-Fruit-Sniper/main/GreatestFruitSniper.luau"))()
 ```
-
+Aegis auth key
+```txt
+aegis_f47a31a9d85bb69395f21db426f7e24559c13084
+```
 ## ✨ Key Features (v3.0)
 - **Event-Driven 0ms Fruit Radar**: Uses `Workspace.ChildAdded` & `Backpack.ChildAdded` for instant detection and auto-store without heavy `GetDescendants()` polling or memory leaks.
 - **Zero-Crash Anti-Detection Flight Engine**: Cached character `BasePart` collision lock, `Physics` Humanoid state lock, zeroed assembly/part velocities, water-safe altitude clamp (`MinY`), and `FlyPlatform` support at `300 studs/s`.
