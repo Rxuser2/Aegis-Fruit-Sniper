@@ -107,6 +107,8 @@ local Config = {
     MinAltitudeY = 2,         -- Above SwimSurface water check
     StopDistance = 2.5,
     PickupTouchRange = 15,
+    AutoFixStuck = true,            -- Auto escape water / under-island stuck & reset fallback
+    AbandonUnreachableFruit = true, -- Skip unreachable fruit & hop new server
 
     -- Dealer & Gacha Sniper
     AutoDealerSniper = false,
@@ -1144,6 +1146,311 @@ local function setCachedPartsCollision(enableFlight, allowTouch)
     end
 end
 
+local AbandonedFruits = setmetatable({}, { __mode = "k" })
+local StuckGuard = {
+    TempRescuePad = nil,
+    LastSoftRescueAt = 0,
+    LastResetAt = 0,
+    SoftRescueTimes = {},
+    InWaterSince = nil,
+    MissingCharSince = nil,
+    AutoRecoverCount = 0,
+    AbandonedCount = 0,
+    LastStatusMsg = nil,
+    LastStatusUntil = 0,
+    TargetInst = nil,
+    TargetLabel = nil,
+    TargetStartAt = 0,
+    BestDist = math.huge,
+    LastProgressAt = 0,
+    MidFlightUnstickTried = false,
+    NearHoverSince = nil,
+    LastDist = nil,
+    RubberbandCount = 0,
+    TargetDeaths = 0,
+    LastAliveChar = nil,
+}
+
+-- Clear any leftover rescue pad from a previous script run
+pcall(function()
+    local oldPad = workspace:FindFirstChild("AegisRescuePad")
+    if oldPad then oldPad:Destroy() end
+end)
+
+function StuckGuard.setStatus(msg, duration)
+    StuckGuard.LastStatusMsg = msg
+    StuckGuard.LastStatusUntil = os.clock() + (duration or 6)
+end
+
+function StuckGuard.destroyRescuePad()
+    local pad = StuckGuard.TempRescuePad
+    StuckGuard.TempRescuePad = nil
+    if pad then
+        pcall(function() pad:Destroy() end)
+    end
+end
+
+function StuckGuard.ensureRescuePad(pos)
+    local pad = StuckGuard.TempRescuePad
+    if not pad or not pad.Parent then
+        pad = Instance.new("Part")
+        pad.Name = "AegisRescuePad"
+        pad.Size = Vector3.new(18, 2, 18)
+        pad.Anchored = true
+        pad.CanCollide = true
+        pad.Material = Enum.Material.SmoothPlastic
+        pad.Color = Color3.fromRGB(0, 210, 255)
+        pad.Transparency = 0.35
+        pad.Parent = workspace
+        StuckGuard.TempRescuePad = pad
+    end
+    pad.Position = Vector3.new(pos.X, pos.Y - 4, pos.Z)
+    return pad
+end
+
+function StuckGuard.buildIgnoreList(char)
+    local ignoreList = {}
+    if char then table.insert(ignoreList, char) end
+    if StuckGuard.TempRescuePad then table.insert(ignoreList, StuckGuard.TempRescuePad) end
+    local fp = workspace:FindFirstChild("AegisFlyPlatform")
+    if fp then table.insert(ignoreList, fp) end
+    return ignoreList
+end
+
+function StuckGuard.raycastSolidDown(x, startY, z, maxDepth, char)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+    local ignoreList = StuckGuard.buildIgnoreList(char)
+    params.FilterDescendantsInstances = ignoreList
+
+    local cursorY = startY
+    local remaining = maxDepth
+    for _ = 1, 8 do
+        if remaining <= 1 then break end
+        local hit = workspace:Raycast(Vector3.new(x, cursorY, z), Vector3.new(0, -remaining, 0), params)
+        if not hit then break end
+        local inst = hit.Instance
+        local skip = false
+        if inst and inst:IsA("BasePart") then
+            if (not inst.CanCollide) or inst.Transparency >= 0.98 then
+                skip = true
+            end
+        end
+        if not skip then
+            return hit.Position.Y, inst
+        end
+        table.insert(ignoreList, inst)
+        params.FilterDescendantsInstances = ignoreList
+        local drop = cursorY - hit.Position.Y + 0.5
+        remaining = remaining - drop
+        cursorY = hit.Position.Y - 0.5
+    end
+    return nil, nil
+end
+
+function StuckGuard.hasOverheadCeiling(pos, char)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+    local ignoreList = StuckGuard.buildIgnoreList(char)
+    params.FilterDescendantsInstances = ignoreList
+
+    local cursorY = pos.Y + 2.5
+    local remaining = 58
+    for _ = 1, 6 do
+        if remaining <= 1 then break end
+        local hit = workspace:Raycast(Vector3.new(pos.X, cursorY, pos.Z), Vector3.new(0, remaining, 0), params)
+        if not hit then break end
+        local inst = hit.Instance
+        local skip = false
+        if inst and inst:IsA("BasePart") then
+            if (not inst.CanCollide) or inst.Transparency >= 0.98 then
+                skip = true
+            end
+        end
+        if not skip then
+            return true, hit.Position.Y
+        end
+        table.insert(ignoreList, inst)
+        params.FilterDescendantsInstances = ignoreList
+        local gain = hit.Position.Y - cursorY + 0.5
+        remaining = remaining - gain
+        cursorY = hit.Position.Y + 0.5
+    end
+    return false, nil
+end
+
+function StuckGuard.findDrySurfaceY(x, z, char, fromY)
+    local startY = math.max((fromY or 0) + 280, 480)
+    local hitY, inst = StuckGuard.raycastSolidDown(x, startY, z, 900, char)
+    if hitY and hitY > 4.0 then
+        return hitY, inst
+    end
+    return nil, nil
+end
+
+function StuckGuard.getCharParts()
+    local char = getCharacter()
+    if not char then return nil, nil, nil end
+    local hrp = getHRP() or char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return char, hrp, hum
+end
+
+function StuckGuard.isStandingOnRescuePad(hrp)
+    local pad = StuckGuard.TempRescuePad
+    if not pad or not pad.Parent or not hrp then return false end
+    local dx = math.abs(hrp.Position.X - pad.Position.X)
+    local dz = math.abs(hrp.Position.Z - pad.Position.Z)
+    local dy = hrp.Position.Y - pad.Position.Y
+    return dx <= 11 and dz <= 11 and dy >= 1.5 and dy <= 9.5
+end
+
+function StuckGuard.diagnoseState(char, hrp, hum)
+    local pos = hrp.Position
+    if StuckGuard.isStandingOnRescuePad(hrp) and hum.Health > 0 then
+        return false, nil, false, nil, nil
+    end
+    local state = hum:GetState()
+    local inWater = (pos.Y < -2.0)
+        or (state == Enum.HumanoidStateType.Swimming)
+        or (pos.Y <= 2.2 and hum.FloorMaterial == Enum.Material.Air)
+
+    local floorBelowY = StuckGuard.raycastSolidDown(pos.X, pos.Y + 1.0, pos.Z, 180, char)
+    local hasCeiling = false
+    if pos.Y < 22 and (inWater or hum.FloorMaterial == Enum.Material.Air or (not floorBelowY) or floorBelowY <= 3.5) then
+        hasCeiling = StuckGuard.hasOverheadCeiling(pos, char)
+    end
+
+    if inWater then
+        if hasCeiling then
+            return true, "terjebak di bawah pulau/air", true, floorBelowY
+        end
+        return true, "terjebak di dalam air", false, floorBelowY
+    end
+
+    if pos.Y < 22 and hasCeiling and ((not floorBelowY) or floorBelowY <= 3.5) then
+        return true, "terjebak di bawah struktur pulau", true, floorBelowY
+    end
+
+    return false, nil, hasCeiling, floorBelowY
+end
+
+function StuckGuard.liftCharacterTo(char, hrp, hum, destPos, togglePartCollision)
+    local savedCollide
+    if togglePartCollision and char then
+        savedCollide = {}
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                savedCollide[obj] = obj.CanCollide
+                obj.CanCollide = false
+            end
+        end
+    end
+
+    pcall(function()
+        hum.Sit = false
+        hum.PlatformStand = false
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.CFrame = CFrame.new(destPos)
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+    end)
+
+    if savedCollide then
+        for part, oldVal in pairs(savedCollide) do
+            if part and part.Parent and not FlightState.Active then
+                part.CanCollide = oldVal
+            end
+        end
+    end
+end
+
+function StuckGuard.onFlightStop()
+    local char, hrp, hum = StuckGuard.getCharParts()
+    if not char or not hrp or not hum or hum.Health <= 0 then return end
+    local pos = hrp.Position
+    local trapped, reason, hasCeiling, floorBelowY = StuckGuard.diagnoseState(char, hrp, hum)
+    if trapped then
+        local dryY = StuckGuard.findDrySurfaceY(pos.X, pos.Z, char, pos.Y)
+        local maxVert = hasCeiling and 140 or 95
+        if dryY and dryY > pos.Y and (dryY - pos.Y) <= maxVert then
+            StuckGuard.destroyRescuePad()
+            StuckGuard.liftCharacterTo(char, hrp, hum, Vector3.new(pos.X, dryY + 4.5, pos.Z), false)
+        else
+            local safeY = math.max(pos.Y + 26, 26)
+            StuckGuard.ensureRescuePad(Vector3.new(pos.X, safeY, pos.Z))
+            StuckGuard.liftCharacterTo(char, hrp, hum, Vector3.new(pos.X, safeY, pos.Z), false)
+        end
+        StuckGuard.AutoRecoverCount = StuckGuard.AutoRecoverCount + 1
+        StuckGuard.setStatus("🛟 Auto-Lift saat berhenti (" .. tostring(reason or "air") .. ")", 6)
+    elseif (not floorBelowY) or floorBelowY <= 3.5 then
+        local safeY = math.max(pos.Y, 22)
+        StuckGuard.ensureRescuePad(Vector3.new(pos.X, safeY, pos.Z))
+        StuckGuard.liftCharacterTo(char, hrp, hum, Vector3.new(pos.X, safeY, pos.Z), false)
+    end
+end
+
+function StuckGuard.rescueCharacter(forceCooldownBypass, reason)
+    local now = os.clock()
+    if (not forceCooldownBypass) and (now - StuckGuard.LastSoftRescueAt) < 2.5 then
+        return false
+    end
+    local char, hrp, hum = StuckGuard.getCharParts()
+    if not char or not hrp or not hum or hum.Health <= 0 then
+        return false
+    end
+
+    StuckGuard.LastSoftRescueAt = now
+    table.insert(StuckGuard.SoftRescueTimes, now)
+    StuckGuard.AutoRecoverCount = StuckGuard.AutoRecoverCount + 1
+
+    local pos = hrp.Position
+    local hasCeiling = StuckGuard.hasOverheadCeiling(pos, char)
+    local dryY = StuckGuard.findDrySurfaceY(pos.X, pos.Z, char, pos.Y)
+    local maxVert = hasCeiling and 140 or 95
+    if dryY and dryY > pos.Y and (dryY - pos.Y) <= maxVert then
+        StuckGuard.destroyRescuePad()
+        StuckGuard.liftCharacterTo(char, hrp, hum, Vector3.new(pos.X, dryY + 4.5, pos.Z), true)
+    else
+        local safeY = math.max(pos.Y + 28, 28)
+        StuckGuard.ensureRescuePad(Vector3.new(pos.X, safeY, pos.Z))
+        StuckGuard.liftCharacterTo(char, hrp, hum, Vector3.new(pos.X, safeY, pos.Z), true)
+    end
+    StuckGuard.setStatus("🛟 Auto-Fix keluar: " .. tostring(reason or "air/stuck"), 6)
+    return true
+end
+
+function StuckGuard.resetCharacter(reason)
+    local now = os.clock()
+    if (now - StuckGuard.LastResetAt) < 10 then
+        return false
+    end
+    StuckGuard.LastResetAt = now
+    StuckGuard.AutoRecoverCount = StuckGuard.AutoRecoverCount + 1
+    StuckGuard.destroyRescuePad()
+    StuckGuard.SoftRescueTimes = {}
+    StuckGuard.InWaterSince = nil
+    StuckGuard.setStatus("🔄 Auto-Reset: " .. tostring(reason or "stuck"), 8)
+    local char, _, hum = StuckGuard.getCharParts()
+    pcall(function()
+        if hum then
+            hum.Sit = false
+            hum.PlatformStand = false
+            hum.Health = 0
+        elseif char then
+            char:BreakJoints()
+        end
+    end)
+    return true
+end
+
+function StuckGuard.canHopWhileMissingChar()
+    if not Config.AutoFixStuck then return false end
+    return StuckGuard.MissingCharSince ~= nil and (os.clock() - StuckGuard.MissingCharSince) >= 14
+end
+
 local function stopFlight()
     local wasActive = FlightState.Active
     FlightState.Active = false
@@ -1153,6 +1460,10 @@ local function stopFlight()
     FlightState.CurrentDistance = 0
     destroyFlyPlatform()
     if wasActive then
+        if Config.AutoFixStuck and not StuckGuard.SuppressLift then
+            pcall(StuckGuard.onFlightStop)
+        end
+        StuckGuard.SuppressLift = false
         setCachedPartsCollision(false, true)
         applyFlightHumanoidStates(false)
     end
@@ -1217,9 +1528,30 @@ addConnection(RunService.RenderStepped, function(dt)
         nextPos = currentPos + delta.Unit * step
     end
 
-    local minY = math.min(Config.MinAltitudeY, targetPos.Y)
-    if nextPos.Y < minY then
-        nextPos = Vector3.new(nextPos.X, minY, nextPos.Z)
+    local horizDist = Vector3.new(delta.X, 0, delta.Z).Magnitude
+    local baseMinY = tonumber(Config.MinAltitudeY) or 2
+    local floorY
+    if horizDist > 22 then
+        floorY = math.max(baseMinY, 14)
+    elseif targetPos.Y >= baseMinY then
+        floorY = baseMinY
+    else
+        floorY = math.max(targetPos.Y, -75)
+    end
+
+    if nextPos.Y < floorY then
+        local climbStep = math.clamp(Config.FlightSpeed, 50, 360) * math.clamp(dt, 1/240, 0.12)
+        local climbY = math.min(floorY, math.max(nextPos.Y, currentPos.Y + math.max(climbStep, 16)))
+        nextPos = Vector3.new(nextPos.X, climbY, nextPos.Z)
+    end
+
+    if Config.AutoFixStuck then
+        local ch = getCharacter()
+        local hu = ch and ch:FindFirstChildOfClass("Humanoid")
+        if hu and hu.Sit then
+            hu.Sit = false
+            hu.Jump = true
+        end
     end
 
     local flatLook = Vector3.new(targetPos.X, nextPos.Y, targetPos.Z)
@@ -1297,6 +1629,16 @@ local function isFruitInstance(inst)
 end
 
 local function shouldSnipeFruit(entry)
+    if entry.Instance then
+        local skipUntil = AbandonedFruits[entry.Instance]
+        if skipUntil then
+            if os.clock() < skipUntil then
+                return false
+            end
+            AbandonedFruits[entry.Instance] = nil
+        end
+    end
+
     if entry.IsNatural then
         if not Config.SnipeNaturalSpawns then return false end
     else
@@ -1993,6 +2335,8 @@ end)
 local function hopToNewServer()
     if IsHopping then return end
     IsHopping = true
+    StuckGuard.SuppressLift = true
+    StuckGuard.destroyRescuePad()
     stopFlight()
     clearAllEsp()
     VisitedServers[tostring(game.JobId)] = os.time()
@@ -2477,6 +2821,274 @@ TabRadar:Button({
     end,
 })
 
+function StuckGuard.abandonTarget(inst, label, reason, mainNow, fruits)
+    if inst then
+        AbandonedFruits[inst] = os.clock() + 240
+    end
+    StuckGuard.AbandonedCount = StuckGuard.AbandonedCount + 1
+    StuckGuard.TargetInst = nil
+    StuckGuard.TargetLabel = nil
+    StuckGuard.NearHoverSince = nil
+    StuckGuard.LastDist = nil
+    StuckGuard.RubberbandCount = 0
+    StuckGuard.TargetDeaths = 0
+    CurrentSnipeTarget = nil
+    StuckGuard.SuppressLift = false
+    stopFlight()
+
+    local nextValid = nil
+    local clock = os.clock()
+    if fruits then
+        for _, entry in ipairs(fruits) do
+            if entry.Instance == inst then
+                entry.MatchesFilter = false
+            elseif entry.MatchesFilter then
+                local skipUntil = entry.Instance and AbandonedFruits[entry.Instance]
+                if skipUntil and clock < skipUntil then
+                    entry.MatchesFilter = false
+                elseif (not nextValid) and entry.Handle and entry.Handle.Parent then
+                    nextValid = entry
+                end
+            end
+        end
+    end
+
+    pcall(rebuildSortedMapFruits)
+
+    if (not nextValid) and Config.AutoServerHop and mainNow then
+        EmptyMapSince = mainNow - 10
+        StuckGuard.setStatus("⏭️ Skip " .. tostring(label or "Fruit") .. " (" .. tostring(reason) .. ") -> Hop Server", 8)
+    else
+        StuckGuard.setStatus("⏭️ Skip " .. tostring(label or "Fruit") .. " (" .. tostring(reason) .. ")", 6)
+    end
+    return nextValid
+end
+
+function StuckGuard.manualFix(fromRemote)
+    if IsHopping then return end
+    StuckGuard.SuppressLift = false
+    CurrentSnipeTarget = nil
+    StuckGuard.TargetInst = nil
+    stopFlight()
+
+    local char, hrp, hum = StuckGuard.getCharParts()
+    if not char or not hrp or not hum or hum.Health <= 0 then
+        StuckGuard.setStatus("🔄 Manual Fix: respawn karakter...", 6)
+        pcall(function() game:GetService("Players").LocalPlayer:LoadCharacter() end)
+        return
+    end
+
+    local clock = os.clock()
+    local trapped, reason = StuckGuard.diagnoseState(char, hrp, hum)
+    local didRecentSoft = (clock - StuckGuard.LastSoftRescueAt) < 12
+
+    if (trapped or hum.Sit) and (not didRecentSoft) then
+        StuckGuard.rescueCharacter(true, reason or "manual unstuck")
+        if not fromRemote then
+            pcall(function()
+                WindUI:Notify({
+                    Title = "Auto-Fix Stuck",
+                    Content = "Karakter diangkat keluar dari air / area terjebak. Tekan lagi jika ingin Reset karakter.",
+                    Duration = 3,
+                    Icon = "life-buoy",
+                })
+            end)
+        end
+    else
+        StuckGuard.resetCharacter("Manual Fix")
+        if not fromRemote then
+            pcall(function()
+                WindUI:Notify({
+                    Title = "Character Reset",
+                    Content = "Karakter di-reset untuk keluar dari stuck.",
+                    Duration = 3,
+                    Icon = "rotate-ccw",
+                })
+            end)
+        end
+    end
+end
+
+function StuckGuard.step(mainNow, snipeTarget, activeTarget, fruits)
+    local clock = os.clock()
+    if StuckGuard.LastStatusMsg and clock >= StuckGuard.LastStatusUntil then
+        StuckGuard.LastStatusMsg = nil
+    end
+
+    local char, hrp, hum = StuckGuard.getCharParts()
+
+    -- Cleanup temporary rescue pad once flying, hopping, moved away, or landed on real terrain
+    local pad = StuckGuard.TempRescuePad
+    if pad then
+        if FlightState.Active or IsHopping then
+            StuckGuard.destroyRescuePad()
+        elseif hrp and hum and pad.Parent then
+            local xzGap = Vector3.new(hrp.Position.X - pad.Position.X, 0, hrp.Position.Z - pad.Position.Z).Magnitude
+            if xzGap > 24 or math.abs(hrp.Position.Y - pad.Position.Y) > 25 then
+                StuckGuard.destroyRescuePad()
+            elseif (not StuckGuard.isStandingOnRescuePad(hrp)) and hum.FloorMaterial ~= Enum.Material.Air and hrp.Position.Y > 4.5 then
+                StuckGuard.destroyRescuePad()
+            end
+        end
+    end
+
+    -- Missing / dead character watchdog
+    if (not char) or (not hrp) or (not hum) or hum.Health <= 0 then
+        if not StuckGuard.MissingCharSince then
+            StuckGuard.MissingCharSince = clock
+        end
+        if StuckGuard.TargetInst and hum and hum.Health <= 0 and StuckGuard.LastAliveChar == char then
+            StuckGuard.TargetDeaths = StuckGuard.TargetDeaths + 1
+            StuckGuard.LastAliveChar = nil
+        end
+        if FlightState.Active then
+            StuckGuard.SuppressLift = true
+            stopFlight()
+            StuckGuard.SuppressLift = false
+        end
+        if Config.AutoFixStuck and (clock - StuckGuard.MissingCharSince) >= 10 and (clock - StuckGuard.LastResetAt) >= 10 then
+            StuckGuard.LastResetAt = clock
+            pcall(function() game:GetService("Players").LocalPlayer:LoadCharacter() end)
+        end
+        return snipeTarget
+    end
+
+    StuckGuard.MissingCharSince = nil
+
+    if Config.AutoFixStuck and hum.Sit then
+        pcall(function()
+            hum.Sit = false
+            hum.Jump = true
+        end)
+    end
+
+    -- Active target unreachability & mid-flight stall detection
+    if FlightState.Active and activeTarget and activeTarget.Handle and activeTarget.Handle.Parent then
+        StuckGuard.InWaterSince = nil
+        local inst = activeTarget.Instance
+        local tPos = activeTarget.Handle.Position
+        local dist = (hrp.Position - tPos).Magnitude
+
+        if StuckGuard.TargetInst ~= inst then
+            StuckGuard.TargetInst = inst
+            StuckGuard.TargetLabel = activeTarget.Name
+            StuckGuard.TargetStartAt = clock
+            StuckGuard.BestDist = dist
+            StuckGuard.LastProgressAt = clock
+            StuckGuard.MidFlightUnstickTried = false
+            StuckGuard.NearHoverSince = nil
+            StuckGuard.LastDist = dist
+            StuckGuard.RubberbandCount = 0
+            StuckGuard.TargetDeaths = 0
+            StuckGuard.LastAliveChar = char
+        else
+            if StuckGuard.LastAliveChar and StuckGuard.LastAliveChar ~= char then
+                StuckGuard.TargetDeaths = StuckGuard.TargetDeaths + 1
+                StuckGuard.LastAliveChar = char
+                StuckGuard.LastProgressAt = clock
+            elseif not StuckGuard.LastAliveChar then
+                StuckGuard.LastAliveChar = char
+            end
+
+            if StuckGuard.LastDist and (dist - StuckGuard.LastDist) > 45 then
+                StuckGuard.RubberbandCount = StuckGuard.RubberbandCount + 1
+            end
+            StuckGuard.LastDist = dist
+
+            if dist < (StuckGuard.BestDist - 12) then
+                StuckGuard.BestDist = dist
+                StuckGuard.LastProgressAt = clock
+            end
+
+            local hoverRange = math.max(tonumber(Config.PickupTouchRange) or 15, 18) + 6
+            if dist <= hoverRange then
+                StuckGuard.NearHoverSince = StuckGuard.NearHoverSince or clock
+            else
+                StuckGuard.NearHoverSince = nil
+            end
+        end
+
+        if Config.AutoFixStuck and (not StuckGuard.MidFlightUnstickTried) and (clock - StuckGuard.LastProgressAt) >= 4.0 and dist > 26 then
+            StuckGuard.MidFlightUnstickTried = true
+            StuckGuard.liftCharacterTo(char, hrp, hum, Vector3.new(hrp.Position.X, math.max(hrp.Position.Y + 28, 28), hrp.Position.Z), false)
+        end
+
+        if Config.AbandonUnreachableFruit then
+            local abandonReason = nil
+            if tPos.Y < -75 or math.abs(tPos.X) > 65000 or math.abs(tPos.Z) > 65000 then
+                abandonReason = "lokasi invalid / bawah map"
+            elseif StuckGuard.RubberbandCount >= 4 then
+                abandonReason = "rubberband anti-cheat"
+            elseif StuckGuard.TargetDeaths >= 2 then
+                abandonReason = "mati 2x menuju fruit"
+            elseif StuckGuard.NearHoverSince then
+                local hoverLimit = (tPos.Y < 2) and 3.5 or 5.0
+                if (clock - StuckGuard.NearHoverSince) >= hoverLimit then
+                    abandonReason = "tidak bisa diambil"
+                end
+            end
+
+            if (not abandonReason) and dist > 26 and (clock - StuckGuard.LastProgressAt) >= 8.0 then
+                abandonReason = "rute terhalang / stuck"
+            elseif (not abandonReason) and (clock - StuckGuard.TargetStartAt) >= 75 then
+                abandonReason = "timeout >75s"
+            end
+
+            if abandonReason then
+                return StuckGuard.abandonTarget(inst, activeTarget.Name, abandonReason, mainNow, fruits)
+            end
+        end
+
+        return snipeTarget
+    end
+
+    -- Clear target tracking when idle
+    StuckGuard.TargetInst = nil
+    StuckGuard.TargetLabel = nil
+    StuckGuard.NearHoverSince = nil
+    StuckGuard.LastDist = nil
+
+    -- Passive underwater / under-island stuck recovery
+    if Config.AutoFixStuck and (not IsHopping) then
+        local trapped, reason = StuckGuard.diagnoseState(char, hrp, hum)
+        if trapped then
+            StuckGuard.InWaterSince = StuckGuard.InWaterSince or clock
+            local lowHp = hum.MaxHealth > 0 and (hum.Health < hum.MaxHealth * 0.65)
+            local criticalHp = hum.MaxHealth > 0 and (hum.Health < hum.MaxHealth * 0.25)
+            if lowHp or hrp.Position.Y < -5 or (clock - StuckGuard.InWaterSince) >= 0.8 then
+                local recent = {}
+                for _, ts in ipairs(StuckGuard.SoftRescueTimes) do
+                    if (clock - ts) <= 18 then
+                        table.insert(recent, ts)
+                    end
+                end
+                StuckGuard.SoftRescueTimes = recent
+
+                if (#recent >= 2) or (hrp.Position.Y < -95) or criticalHp then
+                    StuckGuard.resetCharacter(reason)
+                else
+                    StuckGuard.rescueCharacter(false, reason)
+                end
+            end
+        else
+            StuckGuard.InWaterSince = nil
+        end
+    else
+        StuckGuard.InWaterSince = nil
+    end
+
+    return snipeTarget
+end
+
+TabRadar:Button({
+    Title = "🚑 Auto-Fix Stuck (Keluar Air / Reset)",
+    Desc = "Mengangkat karakter keluar dari air / bawah Middle Town, atau Reset karakter jika ditekan lagi.",
+    Icon = "life-buoy",
+    Callback = function()
+        StuckGuard.manualFix(false)
+    end,
+})
+
 TabRadar:Button({
     Title = "🛑 Emergency Stop Flight & Restore Physics",
     Desc = "Stops flight immediately, removes FlyPlatform, and restores normal Humanoid states.",
@@ -2755,6 +3367,26 @@ TabFlight:Slider({
     Step = 1,
     Callback = function(val)
         Config.MinAltitudeY = tonumber(val) or 2
+        saveConfig()
+    end,
+})
+
+TabFlight:Toggle({
+    Title = "Auto-Fix Stuck (Keluar Air / Reset)",
+    Desc = "Otomatis angkat karakter dari air/bawah pulau (Middle Town), un-sit boat, atau reset jika terjebak berulang.",
+    Value = Config.AutoFixStuck,
+    Callback = function(val)
+        Config.AutoFixStuck = val
+        saveConfig()
+    end,
+})
+
+TabFlight:Toggle({
+    Title = "Relakan Fruit Unreachable & Auto Hop",
+    Desc = "Lewati fruit yang tidak bisa dijangkau/diambil (stuck/rubberband/bawah map) lalu hop ke server baru.",
+    Value = Config.AbandonUnreachableFruit,
+    Callback = function(val)
+        Config.AbandonUnreachableFruit = val
         saveConfig()
     end,
 })
@@ -3192,7 +3824,13 @@ function WebHub.executeCommands(commands)
                         end)
                     end)
                 end
+            elseif act == "fix_stuck" then
+                task.defer(function()
+                    pcall(StuckGuard.manualFix, true)
+                end)
             elseif act == "remote_stop" then
+                StuckGuard.SuppressLift = true
+                StuckGuard.destroyRescuePad()
                 task.defer(function()
                     if WebHub.StopCleanupFn then
                         WebHub.StopCleanupFn()
@@ -3644,8 +4282,12 @@ task.spawn(function()
 
         -- 3. Auto Snipe Map Fruits
         local targetEntry = nil
+        local clockNow = os.clock()
         for _, entry in ipairs(fruits) do
-            if entry.MatchesFilter then
+            local skipUntil = entry.Instance and AbandonedFruits[entry.Instance]
+            if skipUntil and clockNow < skipUntil then
+                entry.MatchesFilter = false
+            elseif entry.MatchesFilter then
                 targetEntry = entry
                 break
             end
@@ -3671,11 +4313,13 @@ task.spawn(function()
             end
         end
 
+        targetEntry = StuckGuard.step(now, targetEntry, Config.AutoSnipeMap and targetEntry or CurrentSnipeTarget, fruits)
+
         -- Smart Server Hop check when no target fruits exist on map (Turbo Mode: 1.0s join grace, <=1.0s hop delay)
         local joinGrace = Config.TurboFastHop and 1.0 or 3.0
         local rawDelay = tonumber(Config.ServerHopDelay) or 2
         local effectiveDelay = Config.TurboFastHop and math.min(rawDelay, 1.0) or rawDelay
-        if Config.AutoServerHop and not IsHopping and not FlightState.Active and ActiveStoreJobs == 0 and targetEntry == nil and (now - ScriptStartTime) >= joinGrace and getCharacter() ~= nil then
+        if Config.AutoServerHop and not IsHopping and not FlightState.Active and ActiveStoreJobs == 0 and targetEntry == nil and (now - ScriptStartTime) >= joinGrace and (getCharacter() ~= nil or StuckGuard.canHopWhileMissingChar()) then
             if not EmptyMapSince then
                 EmptyMapSince = now
             elseif (now - EmptyMapSince) >= effectiveDelay then
@@ -3702,7 +4346,9 @@ task.spawn(function()
         -- 5. Dirty-Checked UI & Floating HUD Updates (Zero Unnecessary UI Relayouts)
         pcall(function()
             local newStatus
-            if FlightState.Active and FlightState.TargetPos then
+            if StuckGuard.LastStatusMsg and os.clock() < StuckGuard.LastStatusUntil and not FlightState.Active and not IsHopping then
+                newStatus = StuckGuard.LastStatusMsg
+            elseif FlightState.Active and FlightState.TargetPos then
                 newStatus = string.format("🚀 Flying to: %s (%d studs)", FlightState.TargetLabel, math.floor(FlightState.CurrentDistance))
                 HudStatusLine.TextColor3 = Color3.fromHex("#00F5A0")
                 local startD = math.max(FlightState.StartDistance, 1)
@@ -3835,6 +4481,8 @@ end)
 -- ============================================================================
 local function fullCleanup()
     RuntimeAlive = false
+    StuckGuard.SuppressLift = true
+    pcall(StuckGuard.destroyRescuePad)
     pcall(stopFlight)
     pcall(clearAllEsp)
     for _, c in ipairs(Connections) do

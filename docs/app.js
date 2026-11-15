@@ -76,6 +76,8 @@ const DEFAULT_CONFIG = {
   AutoRollGacha: true,
   AutoServerHop: true,
   TurboFastHop: true,
+  AutoFixStuck: true,
+  AbandonUnreachableFruit: true,
   ServerHopDelay: 2,
   WebSyncInterval: 5,
   FruitESP: true,
@@ -123,6 +125,8 @@ const TOGGLE_GROUPS = {
   flight: [
     ["AutoServerHop", "Auto Server Hop (Empty Map)"],
     ["TurboFastHop", "Turbo Fast Scan & Hop (<=1s)"],
+    ["AutoFixStuck", "Auto-Fix Stuck (Keluar Air / Reset)"],
+    ["AbandonUnreachableFruit", "Relakan Fruit Unreachable & Auto Hop"],
   ],
   visual: [
     ["FruitESP", "3D Fruit ESP"],
@@ -512,6 +516,7 @@ function renderInstances(instances, serverTime) {
 
         <div class="inst-actions">
           <button class="btn btn-xs btn-cyan" data-act="cmd" data-key="${escapeHtml(inst.instanceKey)}" data-cmd="force_hop">🌐 Hop</button>
+          <button class="btn btn-xs btn-ghost" data-act="cmd" data-key="${escapeHtml(inst.instanceKey)}" data-cmd="fix_stuck">🚑 Fix</button>
           <button class="btn btn-xs btn-ghost" data-act="cmd" data-key="${escapeHtml(inst.instanceKey)}" data-cmd="rescan">📡 Scan</button>
           <button class="btn btn-xs btn-ghost" data-act="cmd" data-key="${escapeHtml(inst.instanceKey)}" data-cmd="roll_gacha">🎰 Gacha</button>
           <button class="btn btn-xs btn-primary" data-act="backup" data-key="${escapeHtml(inst.instanceKey)}">🚀 Kirim Alt ke Sini</button>
