@@ -197,7 +197,7 @@ local CONFIG_FOLDER      = "AegisFruitSniper"
 local CONFIG_FILE        = "AegisFruitSniper/config.json"
 local VISITED_FILE       = "AegisFruitSniper/visited_servers.json"
 local POOL_FILE          = "AegisFruitSniper/server_pool.json"
-local FINGERPRINTS_FILE  = "AegisFruitSniper/fruit_fingerprints.json"
+local FINGERPRINTS_FILE  = "AegisFruitSniper/fruit_fingerprints_v2.json"
 local SCRIPT_FILE        = "AegisFruitSniper/GreatestFruitSniper.luau"
 local IsInitializingUI   = true
 local LastConfigSave     = 0
@@ -457,19 +457,56 @@ pcall(function()
 end)
 
 -- Pre-Pickup Natural Spawn ("Fruit ") Collision-Proof Fingerprint Database
--- Stores SIG (composite mesh+color+anim), MESH@RGB, MAP@RGB, ANIM, and RAW keys with __SHARED__ guard
+-- Stores ONLY composite SIG / SIGMESH / SIGASSET signatures with __SHARED__ guard (never single stems or anims)
 local FruitAssetMap = {
     -- Verified Live Asset Fingerprints (Sand Fruit)
-    ["ANIM:rbxassetid://15123673019"]             = "Sand-Sand",
-    ["MESH:rbxassetid://15111517529@248,217,109"]   = "Sand-Sand",
-    ["RAW:rbxassetid://15111517529"]                = "Sand-Sand",
     ["SIG:rbxassetid://15111517528@40,127,71@|rbxassetid://15111517529@248,217,109@|rbxassetid://15111517558@163,162,165@::rbxassetid://15123673019"] = "Sand-Sand",
-    ["ANIM:rbxassetid://121982453080224"]           = "Control-Control",
+    ["SIGMESH:rbxassetid://15111517528@40,127,71@|rbxassetid://15111517529@248,217,109@|rbxassetid://15111517558@163,162,165@"] = "Sand-Sand",
+    ["SIGASSET:rbxassetid://15111517528@|rbxassetid://15111517529@|rbxassetid://15111517558@"] = "Sand-Sand",
 }
 local LearnedFruitIds = {}
 local LearnedFruitCount = 0
+local LearnedSigCount = 0
 local LastFingerprintSave = 0
+local LastFingerprintUpdateAt = 0
 local PendingNaturalLearn = nil
+local RecentPickedTool = nil
+local notifyToastFn = nil
+
+local function isValidCompositeFingerprintKey(k)
+    if type(k) ~= "string" then return false end
+    return k:sub(1, 4) == "SIG:" or k:sub(1, 8) == "SIGMESH:" or k:sub(1, 9) == "SIGASSET:"
+end
+
+local function extractMeshIdSetFromKeys(keys)
+    local set = {}
+    if type(keys) ~= "table" then return set end
+    for _, k in ipairs(keys) do
+        if type(k) == "string" then
+            local body = k:match("^SIGMESH:(.+)$") or k:match("^SIGASSET:(.+)$") or k:match("^SIG:(.-)::")
+            if body then
+                for part in body:gmatch("[^|]+") do
+                    local mid = part:match("^([^@]+)")
+                    if mid and mid ~= "" and mid ~= "rbxassetid://0" then
+                        set[mid] = true
+                    end
+                end
+            end
+        end
+    end
+    return set
+end
+
+local function keysShareMeshId(keysA, keysB)
+    local setA = extractMeshIdSetFromKeys(keysA)
+    local setB = extractMeshIdSetFromKeys(keysB)
+    for mid in pairs(setA) do
+        if setB[mid] then
+            return true
+        end
+    end
+    return false
+end
 
 local WebHub = {
     KnownGlobalVersion = 0,
@@ -492,13 +529,18 @@ local WebHub = {
 local function recountLearnedFruits()
     table.clear(LearnedFruitIds)
     local cnt = 0
-    for _, v in pairs(FruitAssetMap) do
-        if type(v) == "string" and v ~= "" and v ~= "__SHARED__" and not LearnedFruitIds[v] then
-            LearnedFruitIds[v] = true
-            cnt = cnt + 1
+    local sigCnt = 0
+    for k, v in pairs(FruitAssetMap) do
+        if isValidCompositeFingerprintKey(k) and type(v) == "string" and v ~= "" and v ~= "__SHARED__" then
+            sigCnt = sigCnt + 1
+            if not LearnedFruitIds[v] then
+                LearnedFruitIds[v] = true
+                cnt = cnt + 1
+            end
         end
     end
     LearnedFruitCount = cnt
+    LearnedSigCount = sigCnt
 end
 
 local function loadFruitFingerprints()
@@ -507,7 +549,7 @@ local function loadFruitFingerprints()
             local decoded = HttpService:JSONDecode(readfile(FINGERPRINTS_FILE))
             if type(decoded) == "table" then
                 for assetKey, fruitId in pairs(decoded) do
-                    if type(assetKey) == "string" and type(fruitId) == "string" then
+                    if isValidCompositeFingerprintKey(assetKey) and type(fruitId) == "string" then
                         if fruitId == "__SHARED__" or FruitMetaById[fruitId] then
                             FruitAssetMap[assetKey] = fruitId
                         end
@@ -544,91 +586,106 @@ local function extractInstanceAssetFingerprints(instance)
     if not instance then return keys end
 
     local meshSigParts = {}
+    local assetSigParts = {}
     local animSigParts = {}
-    local coloredMeshKeys = {}
-    local mapKeys = {}
-    local animKeys = {}
-    local rawMeshKeys = {}
 
     local root = instance:FindFirstChild("Fruit")
-    if not root or (not root:FindFirstChildWhichIsA("MeshPart", true) and not root:FindFirstChildWhichIsA("Animation", true)) then
+    if not root or (not root:IsA("MeshPart") and not root:FindFirstChildWhichIsA("MeshPart", true) and not root:FindFirstChildWhichIsA("SpecialMesh", true)) then
         root = instance
     end
 
-    for _, d in ipairs(root:GetDescendants()) do
+    local function inspectNode(d)
         if d:IsA("MeshPart") then
+            if d.Name == "Handle" and d.Transparency >= 0.99 then return end
             local mid = type(d.MeshId) == "string" and d.MeshId or ""
-            local tid = type(d.TextureID) == "string" and d.TextureID or ""
-            local rgb = colorToRgbKey(d.Color)
-            local sa = d:FindFirstChildOfClass("SurfaceAppearance")
-            local cmap = (sa and type(sa.ColorMap) == "string") and sa.ColorMap or ""
-            local texKey = (cmap ~= "" and cmap) or tid
             if mid ~= "" and mid ~= "rbxassetid://0" then
+                local tid = type(d.TextureID) == "string" and d.TextureID or ""
+                local rgb = colorToRgbKey(d.Color)
+                local sa = d:FindFirstChildOfClass("SurfaceAppearance")
+                local cmap = (sa and type(sa.ColorMap) == "string") and sa.ColorMap or ""
+                local texKey = (cmap ~= "" and cmap) or tid
                 table.insert(meshSigParts, mid .. "@" .. rgb .. "@" .. texKey)
-                table.insert(coloredMeshKeys, "MESH:" .. mid .. "@" .. rgb)
-                table.insert(rawMeshKeys, "RAW:" .. mid)
-                if cmap ~= "" and cmap ~= "rbxassetid://0" then
-                    table.insert(mapKeys, "MAP:" .. cmap .. "@" .. rgb)
-                end
+                table.insert(assetSigParts, mid .. "@" .. texKey)
             end
         elseif d:IsA("SpecialMesh") then
             local mid = type(d.MeshId) == "string" and d.MeshId or ""
-            local tid = type(d.TextureId) == "string" and d.TextureId or ""
-            local parentCol = (d.Parent and d.Parent:IsA("BasePart")) and colorToRgbKey(d.Parent.Color) or "0,0,0"
             if mid ~= "" and mid ~= "rbxassetid://0" then
+                local tid = type(d.TextureId) == "string" and d.TextureId or ""
+                local parentCol = (d.Parent and d.Parent:IsA("BasePart")) and colorToRgbKey(d.Parent.Color) or "0,0,0"
                 table.insert(meshSigParts, mid .. "@" .. parentCol .. "@" .. tid)
-                table.insert(coloredMeshKeys, "MESH:" .. mid .. "@" .. parentCol)
-                table.insert(rawMeshKeys, "RAW:" .. mid)
+                table.insert(assetSigParts, mid .. "@" .. tid)
             end
         elseif d:IsA("Animation") then
             local aid = type(d.AnimationId) == "string" and d.AnimationId or ""
             if aid ~= "" and aid ~= "rbxassetid://0" then
                 table.insert(animSigParts, aid)
-                table.insert(animKeys, "ANIM:" .. aid)
             end
         end
     end
 
-    table.sort(meshSigParts)
-    table.sort(animSigParts)
-    if #meshSigParts > 0 or #animSigParts > 0 then
-        table.insert(keys, "SIG:" .. table.concat(meshSigParts, "|") .. "::" .. table.concat(animSigParts, "|"))
+    inspectNode(root)
+    for _, d in ipairs(root:GetDescendants()) do
+        inspectNode(d)
     end
-    for _, k in ipairs(mapKeys) do table.insert(keys, k) end
-    for _, k in ipairs(coloredMeshKeys) do table.insert(keys, k) end
-    for _, k in ipairs(animKeys) do table.insert(keys, k) end
-    for _, k in ipairs(rawMeshKeys) do table.insert(keys, k) end
+
+    -- Never build empty-mesh or anim-only signatures while a model is still streaming
+    if #meshSigParts > 0 then
+        table.sort(meshSigParts)
+        table.sort(assetSigParts)
+        table.sort(animSigParts)
+        if #animSigParts > 0 then
+            table.insert(keys, "SIG:" .. table.concat(meshSigParts, "|") .. "::" .. table.concat(animSigParts, "|"))
+        end
+        table.insert(keys, "SIGMESH:" .. table.concat(meshSigParts, "|"))
+        table.insert(keys, "SIGASSET:" .. table.concat(assetSigParts, "|"))
+    end
 
     return keys
 end
 
-local function learnFingerprintKeys(keys, fruitId)
+local function learnFingerprintKeys(keys, fruitId, forceCorrect)
     if type(keys) ~= "table" or #keys == 0 or type(fruitId) ~= "string" or not FruitMetaById[fruitId] then
-        return false
+        return false, false
     end
     local updated = false
+    local newlyLearnedFruit = not LearnedFruitIds[fruitId]
     for _, k in ipairs(keys) do
-        local existing = FruitAssetMap[k]
-        if existing == nil then
-            FruitAssetMap[k] = fruitId
-            WebHub.PendingFingerprints[k] = fruitId
-            updated = true
-        elseif existing ~= fruitId and existing ~= "__SHARED__" then
-            -- Auto-demote collisions (e.g. shared stem mesh across two fruits)
-            FruitAssetMap[k] = "__SHARED__"
-            WebHub.PendingFingerprints[k] = "__SHARED__"
-            updated = true
+        if isValidCompositeFingerprintKey(k) then
+            local existing = FruitAssetMap[k]
+            if existing == nil then
+                FruitAssetMap[k] = fruitId
+                WebHub.PendingFingerprints[k] = fruitId
+                updated = true
+            elseif existing ~= fruitId and existing ~= "__SHARED__" then
+                if forceCorrect then
+                    -- Physical mesh overlap on pickup proved true fruit identity
+                    if k:sub(1, 9) == "SIGASSET:" then
+                        FruitAssetMap[k] = "__SHARED__"
+                        WebHub.PendingFingerprints[k] = "__SHARED__"
+                    else
+                        FruitAssetMap[k] = fruitId
+                        WebHub.PendingFingerprints[k] = fruitId
+                    end
+                    updated = true
+                else
+                    -- Auto-demote genuine collisions (e.g. recolored variants sharing SIGASSET)
+                    FruitAssetMap[k] = "__SHARED__"
+                    WebHub.PendingFingerprints[k] = "__SHARED__"
+                    updated = true
+                end
+            end
         end
     end
     if updated then
+        LastFingerprintUpdateAt = os.clock()
         saveFruitFingerprints(false)
     end
-    return updated
+    return updated, newlyLearnedFruit
 end
 
 local function learnFruitFingerprint(instance, fruitId)
     if not instance or type(fruitId) ~= "string" or not FruitMetaById[fruitId] then return false end
-    return learnFingerprintKeys(extractInstanceAssetFingerprints(instance), fruitId)
+    return learnFingerprintKeys(extractInstanceAssetFingerprints(instance), fruitId, false)
 end
 
 local function scanAllVisibleToolsForFingerprints()
@@ -666,7 +723,12 @@ local function scanAllVisibleToolsForFingerprints()
         if holder then
             for _, ch in ipairs(holder:GetChildren()) do
                 local itemId = tonumber(ch:GetAttribute("ItemId")) or tonumber(ch.Name:match("%-(%d+)%]"))
-                local meta = (itemId and FruitMetaByItemId[itemId]) or FruitMetaById[ch.Name:match("^(.-)%s*%[") or ""]
+                local bracketPrefix = ch.Name:match("^(.-)%s*%[") or ch.Name
+                local cleanPrefix = bracketPrefix:gsub(" Fruit$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                local meta = (itemId and FruitMetaByItemId[itemId])
+                    or FruitMetaById[bracketPrefix]
+                    or FruitMetaById[cleanPrefix]
+                    or FruitMetaByShort[cleanPrefix:lower()]
                 if meta then
                     learnFruitFingerprint(ch, meta.Id)
                 end
@@ -720,49 +782,51 @@ local function resolveFruitMeta(instance)
 
     local name = instance.Name
     if name == "Fruit " or name == "Fruit" then
-        -- 2. Match Collision-Proof Signature (SIG -> MAP -> MESH@RGB -> ANIM -> RAW)
+        -- 2. Match Collision-Proof Composite Signature ONLY (SIG -> SIGMESH -> SIGASSET)
         local keys = extractInstanceAssetFingerprints(instance)
         for _, key in ipairs(keys) do
-            local mappedId = FruitAssetMap[key]
-            if mappedId and mappedId ~= "__SHARED__" and FruitMetaById[mappedId] then
-                return FruitMetaById[mappedId]
-            end
-            -- Backward compatibility for raw rbxassetid keys without prefix
-            local rawPart = key:match("^RAW:(.+)$") or key:match("^ANIM:(.+)$")
-            if rawPart then
-                local legacyMapped = FruitAssetMap[rawPart]
-                if legacyMapped and legacyMapped ~= "__SHARED__" and FruitMetaById[legacyMapped] then
-                    return FruitMetaById[legacyMapped]
+            if isValidCompositeFingerprintKey(key) then
+                local mappedId = FruitAssetMap[key]
+                if mappedId and mappedId ~= "__SHARED__" and FruitMetaById[mappedId] then
+                    return FruitMetaById[mappedId]
                 end
             end
         end
 
-        -- 3. Check all descendant names, attributes, and StringValues for any known fruit name
+        -- 3. Check explicit ItemId/OriginalName attributes, StringValues, or exact child Model/Tool names (NO substring matching!)
         for _, d in ipairs(instance:GetDescendants()) do
             local dItemId = tonumber(d:GetAttribute("ItemId"))
             if dItemId and FruitMetaByItemId[dItemId] then
                 local m = FruitMetaByItemId[dItemId]
-                learnFingerprintKeys(keys, m.Id)
+                learnFingerprintKeys(keys, m.Id, false)
                 return m
             end
-            local dOrig = d:GetAttribute("OriginalName") or d:GetAttribute("FruitName") or (d:IsA("StringValue") and d.Value)
+            local dOrig = d:GetAttribute("OriginalName") or d:GetAttribute("FruitName") or d:GetAttribute("StorageKey")
             if type(dOrig) == "string" and dOrig ~= "" then
-                local m = FruitMetaById[dOrig] or FruitMetaByShort[dOrig:gsub(" Fruit$", ""):lower()]
+                local cleanAttr = dOrig:gsub(" Fruit$", ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+                local m = FruitMetaById[dOrig] or FruitMetaByShort[cleanAttr]
                 if m then
-                    learnFingerprintKeys(keys, m.Id)
+                    learnFingerprintKeys(keys, m.Id, false)
                     return m
                 end
             end
-            local dClean = d.Name:gsub(" Fruit$", ""):lower()
-            if FruitMetaByShort[dClean] and dClean ~= "fruit" then
-                local m = FruitMetaByShort[dClean]
-                learnFingerprintKeys(keys, m.Id)
-                return m
+            if d:IsA("StringValue") and type(d.Value) == "string" and d.Value ~= "" then
+                local val = d.Value:gsub("^%s+", ""):gsub("%s+$", "")
+                local m = FruitMetaById[val]
+                if not m and val:match(" Fruit$") then
+                    m = FruitMetaByShort[val:gsub(" Fruit$", ""):lower()]
+                end
+                if m then
+                    learnFingerprintKeys(keys, m.Id, false)
+                    return m
+                end
             end
-            for shortKey, metaItem in pairs(FruitMetaByShort) do
-                if #shortKey >= 4 and dClean:find(shortKey, 1, true) then
-                    learnFingerprintKeys(keys, metaItem.Id)
-                    return metaItem
+            if (d:IsA("Model") or d:IsA("Tool")) and d.Name ~= "Fruit" and d.Name ~= "Fruit " then
+                local dClean = d.Name:gsub(" Fruit$", ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+                if dClean ~= "fruit" and FruitMetaByShort[dClean] then
+                    local m = FruitMetaByShort[dClean]
+                    learnFingerprintKeys(keys, m.Id, false)
+                    return m
                 end
             end
         end
@@ -1247,11 +1311,11 @@ local function registerWorkspaceFruit(child)
     if not handle or not handle:IsA("BasePart") then return end
 
     local isNatural = child:IsA("Model") and (child.Name == "Fruit " or child.Name == "Fruit")
-    -- Brief yield (max 0.2s) only if a natural spawn's Fruit mesh model hasn't replicated alongside Handle yet
-    if isNatural and not child:FindFirstChild("Fruit") and not child:FindFirstChildWhichIsA("MeshPart", true) then
+    -- Brief yield (max 0.35s) if natural spawn's MeshPart/SpecialMesh hasn't streamed alongside Handle yet
+    if isNatural and not child:FindFirstChildWhichIsA("MeshPart", true) and not child:FindFirstChildWhichIsA("SpecialMesh", true) then
         local t0 = os.clock()
-        while child.Parent and (os.clock() - t0) < 0.2 do
-            if child:FindFirstChild("Fruit") or child:FindFirstChildWhichIsA("MeshPart", true) then
+        while child.Parent and (os.clock() - t0) < 0.35 do
+            if child:FindFirstChildWhichIsA("MeshPart", true) or child:FindFirstChildWhichIsA("SpecialMesh", true) then
                 break
             end
             task.wait(0.03)
@@ -1277,6 +1341,7 @@ local function registerWorkspaceFruit(child)
         MatchesFilter = false,
         AssetKeys = assetKeys,
         CreatedAt = os.clock(),
+        LastResolveAt = os.clock(),
     }
     applyMetaToEntry(entry, meta)
     TrackedFruitEntries[child] = entry
@@ -1327,11 +1392,20 @@ local function rebuildSortedMapFruits()
         if inst and inst.Parent == Workspace and entry.Handle and entry.Handle.Parent then
             entry.Position = entry.Handle.Position
             entry.Distance = hrp and math.floor((hrpPos - entry.Position).Magnitude) or 0
-            -- Late-streaming re-identification during the first 2.5s if Fruit mesh wasn't ready at registration
-            if entry.IsNatural and entry.Meta and entry.Meta.Id == "Unknown-Spawn" and (now - (entry.CreatedAt or now)) <= 2.5 then
+            -- Late-streaming re-identification during first 4.0s OR right after DB learns new fingerprints
+            local needsStreamingCheck = entry.IsNatural and (now - (entry.CreatedAt or now)) <= 4.0 and (#(entry.AssetKeys or {}) == 0 or (entry.Meta and entry.Meta.Id == "Unknown-Spawn"))
+            local dbJustUpdated = entry.IsNatural and entry.Meta and entry.Meta.Id == "Unknown-Spawn" and LastFingerprintUpdateAt > (entry.LastResolveAt or 0)
+            if needsStreamingCheck or dbJustUpdated then
+                local freshKeys = extractInstanceAssetFingerprints(inst)
+                if #freshKeys > #(entry.AssetKeys or {}) then
+                    entry.AssetKeys = freshKeys
+                end
                 local freshMeta = resolveFruitMeta(inst)
+                entry.LastResolveAt = now
                 if freshMeta and freshMeta.Id ~= "Unknown-Spawn" then
-                    entry.AssetKeys = extractInstanceAssetFingerprints(inst)
+                    if #freshKeys > 0 then
+                        entry.AssetKeys = freshKeys
+                    end
                     applyMetaToEntry(entry, freshMeta)
                 else
                     entry.MatchesFilter = shouldSnipeFruit(entry)
@@ -1386,12 +1460,49 @@ end)
 addConnection(Workspace.ChildRemoved, function(child)
     local entry = TrackedFruitEntries[child]
     if entry then
-        if entry.IsNatural and entry.Meta and entry.Meta.Id == "Unknown-Spawn" and entry.AssetKeys and #entry.AssetKeys > 0 then
-            PendingNaturalLearn = {
-                Keys = entry.AssetKeys,
-                Pos = entry.Position,
-                RemovedAt = os.clock(),
-            }
+        if entry.IsNatural then
+            local latestKeys = (#(entry.AssetKeys or {}) > 0) and entry.AssetKeys or extractInstanceAssetFingerprints(child)
+            local hrp = getHRP()
+            local removeDist = hrp and (hrp.Position - entry.Position).Magnitude or 999
+            local wasTarget = (CurrentSnipeTarget and CurrentSnipeTarget.Instance == child)
+            if latestKeys and #latestKeys > 0 and (removeDist <= 55 or (wasTarget and removeDist <= 85)) then
+                local guessedId = (entry.Meta and entry.Meta.Id) or "Unknown-Spawn"
+                -- Handle race where Backpack Tool arrived <= 1.5s BEFORE Workspace.ChildRemoved
+                if RecentPickedTool and (os.clock() - RecentPickedTool.At) <= 1.5 then
+                    local overlap = keysShareMeshId(RecentPickedTool.Keys, latestKeys)
+                    if overlap or removeDist <= 30 then
+                        local wrongPreGuess = (guessedId ~= "Unknown-Spawn" and guessedId ~= RecentPickedTool.OrigName)
+                        local updated, newlyLearned = learnFingerprintKeys(latestKeys, RecentPickedTool.OrigName, overlap and wrongPreGuess)
+                        if wrongPreGuess or updated then
+                            rebuildSortedMapFruits()
+                        end
+                        if (newlyLearned or wrongPreGuess) and notifyToastFn then
+                            local learnedMeta = FruitMetaById[RecentPickedTool.OrigName]
+                            pcall(notifyToastFn, wrongPreGuess and "🧬 Auto-Corrected Fruit ID!" or "🧬 Natural Fruit Learned!", string.format("%s mapped to %d 3D signatures (synced).", learnedMeta and learnedMeta.Display or RecentPickedTool.OrigName, #latestKeys), "sparkles")
+                        end
+                        RecentPickedTool = nil
+                        PendingNaturalLearn = nil
+                    else
+                        PendingNaturalLearn = {
+                            Keys = latestKeys,
+                            Pos = entry.Position,
+                            GuessedId = guessedId,
+                            RemoveDist = removeDist,
+                            WasTarget = wasTarget,
+                            RemovedAt = os.clock(),
+                        }
+                    end
+                else
+                    PendingNaturalLearn = {
+                        Keys = latestKeys,
+                        Pos = entry.Position,
+                        GuessedId = guessedId,
+                        RemoveDist = removeDist,
+                        WasTarget = wasTarget,
+                        RemovedAt = os.clock(),
+                    }
+                end
+            end
         end
         TrackedFruitEntries[child] = nil
         if CurrentSnipeTarget and CurrentSnipeTarget.Instance == child then
@@ -1416,17 +1527,39 @@ local function storeSingleFruitTool(tool)
         end
     end
 
-    -- Auto-learn fingerprint immediately from the physical Tool & any recently picked-up natural spawn!
+    -- Auto-learn fingerprint immediately from Tool & cross-verify any recently picked-up natural spawn
     local catchSource = "Dropped/Gacha"
     if FruitMetaById[origName] then
+        local toolKeys = extractInstanceAssetFingerprints(tool)
         learnFruitFingerprint(tool, origName)
+        local consumedNatural = false
         if PendingNaturalLearn and (os.clock() - PendingNaturalLearn.RemovedAt) <= 4.0 then
-            local hrp = getHRP()
-            if not hrp or (hrp.Position - PendingNaturalLearn.Pos).Magnitude <= 90 then
-                learnFingerprintKeys(PendingNaturalLearn.Keys, origName)
+            local overlap = keysShareMeshId(toolKeys, PendingNaturalLearn.Keys)
+            local closeEnough = (PendingNaturalLearn.RemoveDist <= 45) or (PendingNaturalLearn.WasTarget and PendingNaturalLearn.RemoveDist <= 85)
+            if overlap or closeEnough then
+                local guessed = PendingNaturalLearn.GuessedId or "Unknown-Spawn"
+                local wrongPreGuess = (guessed ~= "Unknown-Spawn" and guessed ~= origName)
+                local updated, newlyLearned = learnFingerprintKeys(PendingNaturalLearn.Keys, origName, overlap and wrongPreGuess)
+                if wrongPreGuess or updated then
+                    rebuildSortedMapFruits()
+                end
+                if (newlyLearned or wrongPreGuess) and notifyToastFn then
+                    local learnedMeta = FruitMetaById[origName]
+                    pcall(notifyToastFn, wrongPreGuess and "🧬 Auto-Corrected Fruit ID!" or "🧬 Natural Fruit Learned!", string.format("%s mapped to %d 3D signatures (synced).", learnedMeta and learnedMeta.Display or origName, #PendingNaturalLearn.Keys), "sparkles")
+                end
                 PendingNaturalLearn = nil
                 catchSource = "Natural"
+                consumedNatural = true
             end
+        end
+        if not consumedNatural then
+            local hrp = getHRP()
+            RecentPickedTool = {
+                OrigName = origName,
+                Keys = toolKeys,
+                Pos = hrp and hrp.Position or Vector3.zero,
+                At = os.clock(),
+            }
         end
     end
 
@@ -2144,6 +2277,15 @@ end
 
 local WindUI = loadWindUILibrary()
 
+notifyToastFn = function(title, content, icon)
+    WindUI:Notify({
+        Title = tostring(title or "Aegis Notification"),
+        Content = tostring(content or ""),
+        Duration = 3,
+        Icon = icon or "bell",
+    })
+end
+
 pcall(function()
     WindUI:AddTheme({
         Name = "AegisCyber",
@@ -2341,7 +2483,40 @@ TabFilter:Section({ Title = "Fruit Source Types" })
 
 local FingerprintDbParagraph = TabFilter:Paragraph({
     Title = "🧬 Pre-Pickup Natural Spawn DB",
-    Desc = string.format("Learned %d fruit 3D mesh fingerprints (auto-learns on pickup & visible tools).", LearnedFruitCount),
+    Desc = string.format("Learned %d fruits (%d 3D composite signatures) — auto-learns on pickups, visible players & Cloud DB.", LearnedFruitCount, LearnedSigCount),
+})
+
+TabFilter:Button({
+    Title = "🗑️ Reset Local Pre-ID Cache (Force Re-Learn)",
+    Desc = "Clears cached natural spawn fingerprints locally and re-scans equipped tools right now.",
+    Icon = "trash-2",
+    Callback = function()
+        table.clear(FruitAssetMap)
+        FruitAssetMap["SIG:rbxassetid://15111517528@40,127,71@|rbxassetid://15111517529@248,217,109@|rbxassetid://15111517558@163,162,165@::rbxassetid://15123673019"] = "Sand-Sand"
+        FruitAssetMap["SIGMESH:rbxassetid://15111517528@40,127,71@|rbxassetid://15111517529@248,217,109@|rbxassetid://15111517558@163,162,165@"] = "Sand-Sand"
+        FruitAssetMap["SIGASSET:rbxassetid://15111517528@|rbxassetid://15111517529@|rbxassetid://15111517558@"] = "Sand-Sand"
+        table.clear(WebHub.PendingFingerprints)
+        LastFingerprintUpdateAt = os.clock()
+        pcall(function()
+            if isfile and delfile and isfile(FINGERPRINTS_FILE) then
+                delfile(FINGERPRINTS_FILE)
+            end
+        end)
+        saveFruitFingerprints(true)
+        scanAllVisibleToolsForFingerprints()
+        rebuildSortedMapFruits()
+        FingerprintDbParagraph:SetDesc(string.format(
+            "Learned %d fruits (%d 3D composite signatures) — auto-learns on pickups, visible players & Cloud DB.",
+            LearnedFruitCount,
+            LearnedSigCount
+        ))
+        WindUI:Notify({
+            Title = "Pre-ID DB Reset Complete",
+            Content = string.format("Reset & re-scanned: %d fruits (%d signatures).", LearnedFruitCount, LearnedSigCount),
+            Duration = 3,
+            Icon = "refresh-cw",
+        })
+    end,
 })
 
 TabFilter:Toggle({
@@ -3074,16 +3249,18 @@ function WebHub.syncNow(force, liveStatusText)
                 end
             end
 
-            -- Snapshot pending fingerprints; if remote DB is empty, seed local fingerprints once
+            -- Snapshot pending composite fingerprints only; if remote DB is empty, seed local composite fingerprints once
             local uploadFps = {}
             local uploadCount = 0
             for k, v in pairs(WebHub.PendingFingerprints) do
-                uploadFps[k] = v
-                uploadCount = uploadCount + 1
+                if isValidCompositeFingerprintKey(k) then
+                    uploadFps[k] = v
+                    uploadCount = uploadCount + 1
+                end
             end
             if WebHub.KnownFpTotal == 0 and uploadCount == 0 then
                 for k, v in pairs(FruitAssetMap) do
-                    if type(k) == "string" and type(v) == "string" and v ~= "" then
+                    if isValidCompositeFingerprintKey(k) and type(v) == "string" and v ~= "" then
                         uploadFps[k] = v
                         uploadCount = uploadCount + 1
                     end
@@ -3183,7 +3360,7 @@ function WebHub.syncNow(force, liveStatusText)
             if type(data.globalFingerprints) == "table" then
                 local mergedFp = false
                 for ak, fid in pairs(data.globalFingerprints) do
-                    if type(ak) == "string" and type(fid) == "string" and (fid == "__SHARED__" or FruitMetaById[fid]) then
+                    if isValidCompositeFingerprintKey(ak) and type(fid) == "string" and (fid == "__SHARED__" or FruitMetaById[fid]) then
                         if FruitAssetMap[ak] ~= fid then
                             FruitAssetMap[ak] = fid
                             mergedFp = true
@@ -3191,6 +3368,7 @@ function WebHub.syncNow(force, liveStatusText)
                     end
                 end
                 if mergedFp then
+                    LastFingerprintUpdateAt = os.clock()
                     saveFruitFingerprints(true)
                     rebuildSortedMapFruits()
                 else
@@ -3444,8 +3622,9 @@ task.spawn(function()
             if LearnedFruitCount ~= lastLearnedCount then
                 lastLearnedCount = LearnedFruitCount
                 FingerprintDbParagraph:SetDesc(string.format(
-                    "Learned %d fruit 3D mesh fingerprints (auto-learns on pickup & visible tools).",
-                    LearnedFruitCount
+                    "Learned %d fruits (%d 3D composite signatures) — auto-learns on pickups, visible players & Cloud DB.",
+                    LearnedFruitCount,
+                    LearnedSigCount
                 ))
             end
 

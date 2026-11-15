@@ -270,11 +270,14 @@ export class AegisHubDO extends DurableObject {
       now
     );
 
-    // Merge newly learned fingerprints with collision protection
+    // Merge newly learned composite fingerprints ONLY with collision protection
     const newFps = normalizeMapObject(payload.newFingerprints);
     let uploadedFpCount = 0;
     for (const [assetKey, rawFruitId] of Object.entries(newFps)) {
       if (typeof assetKey !== "string" || typeof rawFruitId !== "string" || !assetKey || !rawFruitId) continue;
+      if (!assetKey.startsWith("SIG:") && !assetKey.startsWith("SIGMESH:") && !assetKey.startsWith("SIGASSET:")) {
+        continue;
+      }
       const existing = this.sql.exec("SELECT fruit_id FROM fingerprints WHERE asset_key = ?", assetKey).toArray()[0];
       let targetFruitId = rawFruitId;
       if (existing) {
@@ -574,6 +577,17 @@ export class AegisHubDO extends DurableObject {
     this.sql.exec("DELETE FROM fingerprints WHERE asset_key = ?", assetKey);
     return { ok: true };
   }
+
+  async clearFingerprints(mode = "all") {
+    if (mode === "legacy") {
+      this.sql.exec(
+        "DELETE FROM fingerprints WHERE asset_key NOT LIKE 'SIG:%' AND asset_key NOT LIKE 'SIGMESH:%' AND asset_key NOT LIKE 'SIGASSET:%'"
+      );
+    } else {
+      this.sql.exec("DELETE FROM fingerprints");
+    }
+    return { ok: true, mode };
+  }
 }
 
 export default {
@@ -652,6 +666,11 @@ export default {
       if (url.pathname.startsWith("/api/fingerprint/") && request.method === "DELETE") {
         const assetKey = decodeURIComponent(url.pathname.slice("/api/fingerprint/".length));
         return jsonResponse(await stub.deleteFingerprint(assetKey));
+      }
+
+      if (url.pathname === "/api/fingerprints" && request.method === "DELETE") {
+        const mode = url.searchParams.get("mode") || "all";
+        return jsonResponse(await stub.clearFingerprints(mode));
       }
 
       return jsonResponse({ ok: false, error: "Not found" }, 404);
