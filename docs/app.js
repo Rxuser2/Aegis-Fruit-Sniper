@@ -190,6 +190,9 @@ const state = {
   invRarityFilter: "ALL",
   invOnlyOnline: false,
   serverOffsetMs: 0,
+  pollErrorCount: 0,
+  pollingActive: false,
+  refreshInFlight: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -343,35 +346,68 @@ function lockDashboard() {
   $("login-screen").classList.remove("hidden");
 }
 
+function scheduleNextPoll() {
+  if (!state.pollingActive) return;
+  if (state.pollTimer) {
+    clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+  }
+  const delayMs =
+    state.pollErrorCount > 0
+      ? Math.min(15000, 4000 * Math.pow(2, Math.min(state.pollErrorCount, 2)))
+      : 4000;
+  state.pollTimer = setTimeout(async () => {
+    if (!state.pollingActive) return;
+    if (document.visibilityState === "visible") {
+      await refreshDashboard(false);
+    }
+    scheduleNextPoll();
+  }, delayMs);
+}
+
 function startPolling() {
   stopPolling();
-  state.pollTimer = setInterval(() => {
-    if (document.visibilityState === "visible") {
-      refreshDashboard(false);
-    }
-  }, 2500);
+  state.pollingActive = true;
+  state.pollErrorCount = 0;
+  scheduleNextPoll();
 }
 
 function stopPolling() {
+  state.pollingActive = false;
   if (state.pollTimer) {
-    clearInterval(state.pollTimer);
+    clearTimeout(state.pollTimer);
     state.pollTimer = null;
   }
 }
 
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state.pollingActive && !state.refreshInFlight) {
+    refreshDashboard(false).finally(scheduleNextPoll);
+  }
+});
+
 async function refreshDashboard(forceConfigSync = false) {
+  if (state.refreshInFlight && !forceConfigSync) return;
+  state.refreshInFlight = true;
   try {
     const data = await apiFetch("/api/dashboard");
     state.dashboard = data;
+    state.pollErrorCount = 0;
     $("conn-dot").classList.remove("err");
-    $("conn-subtitle").textContent = `Terhubung • Sync ${new Date(data.serverTime).toLocaleTimeString("id-ID")}`;
+    const syncTime = new Date(data.serverTime).toLocaleTimeString("id-ID");
+    $("conn-subtitle").textContent = data.cacheStatus?.quotaDegraded
+      ? `Terhubung (Mode RAM Darurat s.d. reset 00:00 UTC) • Sync ${syncTime}`
+      : `Terhubung • Sync ${syncTime}`;
     renderAll(forceConfigSync);
   } catch (err) {
+    state.pollErrorCount += 1;
     $("conn-dot").classList.add("err");
     $("conn-subtitle").textContent = "Terputus: " + err.message;
     if (err.message.includes("401")) {
       lockDashboard();
     }
+  } finally {
+    state.refreshInFlight = false;
   }
 }
 
