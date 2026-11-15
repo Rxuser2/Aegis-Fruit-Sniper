@@ -85,8 +85,14 @@ export class AegisHubDO extends DurableObject {
           active_config_json TEXT NOT NULL DEFAULT '{}',
           override_config_json TEXT NOT NULL DEFAULT '{}',
           override_version INTEGER NOT NULL DEFAULT 0,
-          last_seen INTEGER NOT NULL DEFAULT 0
+          last_seen INTEGER NOT NULL DEFAULT 0,
+          started_at INTEGER NOT NULL DEFAULT 0,
+          inventory_json TEXT NOT NULL DEFAULT '{}'
         );
+      `);
+      try { this.sql.exec("ALTER TABLE instances ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0"); } catch {}
+      try { this.sql.exec("ALTER TABLE instances ADD COLUMN inventory_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
+      this.sql.exec(`
 
         CREATE TABLE IF NOT EXISTS meta_kv (
           k TEXT PRIMARY KEY,
@@ -172,7 +178,7 @@ export class AegisHubDO extends DurableObject {
     const jobId = String(payload.jobId || "").trim();
 
     const prevInst = this.sql
-      .exec("SELECT job_id, override_config_json, override_version FROM instances WHERE instance_key = ?", instanceKey)
+      .exec("SELECT job_id, override_config_json, override_version, started_at, last_seen FROM instances WHERE instance_key = ?", instanceKey)
       .toArray()[0];
 
     // If instance hopped away from an old server, mark old server as checked (5 min cross-account cooldown)
@@ -215,6 +221,25 @@ export class AegisHubDO extends DurableObject {
     // Prune expired server locks
     this.sql.exec("DELETE FROM server_locks WHERE locked_until < ?", now);
 
+    // Resolve continuous running start timestamp across server hops
+    const rawStartedAt = Number(payload.startedAt || 0);
+    let startedAt = now;
+    if (rawStartedAt > 0 && rawStartedAt <= now + 60_000) {
+      startedAt = rawStartedAt;
+    } else if (prevInst?.started_at > 0 && now - (prevInst.last_seen || 0) <= 180_000) {
+      startedAt = prevInst.started_at;
+    }
+
+    const rawInv = normalizeMapObject(payload.inventory);
+    const invSnapshot = {
+      stored: Array.isArray(rawInv.stored) ? rawInv.stored.slice(0, 60) : [],
+      held: Array.isArray(rawInv.held) ? rawInv.held.slice(0, 12) : [],
+      totalStoredCount: Number(rawInv.totalStoredCount || 0),
+      totalUnique: Number(rawInv.totalUnique || 0),
+      totalValue: Number(rawInv.totalValue || 0),
+      updatedAt: Number(rawInv.updatedAt || now),
+    };
+
     // Upsert instance telemetry snapshot
     const activeCfg = normalizeMapObject(payload.activeConfig);
     this.sql.exec(
@@ -222,8 +247,9 @@ export class AegisHubDO extends DurableObject {
          instance_key, player_name, display_name, user_id, level, beli, equipped_fruit,
          place_id, job_id, players_count, max_players, status, flight_target,
          map_fruits_json, dealer_stock_json, stored_session, pool_count, learned_count,
-         webhook_sent, turbo_mode, active_config_json, override_config_json, override_version, last_seen
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 0, ?)
+         webhook_sent, turbo_mode, active_config_json, override_config_json, override_version,
+         last_seen, started_at, inventory_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 0, ?, ?, ?)
        ON CONFLICT(instance_key) DO UPDATE SET
          player_name = excluded.player_name,
          display_name = excluded.display_name,
@@ -245,7 +271,9 @@ export class AegisHubDO extends DurableObject {
          webhook_sent = excluded.webhook_sent,
          turbo_mode = excluded.turbo_mode,
          active_config_json = excluded.active_config_json,
-         last_seen = excluded.last_seen`,
+         last_seen = excluded.last_seen,
+         started_at = excluded.started_at,
+         inventory_json = excluded.inventory_json`,
       instanceKey,
       playerName,
       displayName,
@@ -267,7 +295,9 @@ export class AegisHubDO extends DurableObject {
       Number(payload.webhookSent || 0),
       payload.turboMode ? 1 : 0,
       JSON.stringify(activeCfg),
-      now
+      now,
+      startedAt,
+      JSON.stringify(invSnapshot)
     );
 
     // Merge newly learned composite fingerprints ONLY with collision protection
@@ -480,6 +510,8 @@ export class AegisHubDO extends DurableObject {
       overrideConfig: safeParseJson(r.override_config_json, {}),
       overrideVersion: r.override_version,
       lastSeen: r.last_seen,
+      startedAt: r.started_at || r.last_seen || now,
+      inventory: safeParseJson(r.inventory_json, { stored: [], held: [], totalStoredCount: 0, totalUnique: 0, totalValue: 0 }),
       online: now - r.last_seen < 20_000,
     }));
 
@@ -600,7 +632,7 @@ export default {
       }
 
       if (url.pathname === "/api/health" && request.method === "GET") {
-        return jsonResponse({ ok: true, service: "aegis-fruit-hub", version: "3.2" });
+        return jsonResponse({ ok: true, service: "aegis-fruit-hub", version: "3.4" });
       }
 
       const authorized = await verifyAccessKey(request, env.AEGIS_ACCESS_KEY);

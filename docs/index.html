@@ -56,6 +56,7 @@
 
       <nav class="nav-tabs" role="tablist">
         <button class="nav-btn active" data-tab="instances">🖥️ Instances <span class="badge-mini" id="badge-online">0</span></button>
+        <button class="nav-btn" data-tab="inventory">🎒 Inventory Akun <span class="badge-mini" id="badge-inv-total">0</span></button>
         <button class="nav-btn" data-tab="config">⚙️ Remote Config</button>
         <button class="nav-btn" data-tab="intel">📦 History, Dealer & DB</button>
       </nav>
@@ -114,6 +115,34 @@
       <!-- TAB 1: INSTANCES -->
       <section id="tab-instances" class="tab-panel active">
         <div id="instances-grid" class="instances-grid"></div>
+      </section>
+
+      <!-- TAB 2: INVENTORY SEMUA AKUN -->
+      <section id="tab-inventory" class="tab-panel">
+        <div class="inventory-toolbar glass">
+          <div class="inv-toolbar-top">
+            <div>
+              <h2>🎒 Inventory Fruit Semua Akun</h2>
+              <p class="muted small" id="inv-summary-line">0 fruit tersimpan • Estimasi $0 Beli • 0 akun</p>
+            </div>
+            <div class="inv-controls">
+              <input id="inv-search" type="search" class="search-input" placeholder="Cari fruit di semua akun (e.g. Kitsune, Dough)..." />
+              <label class="inv-online-toggle">
+                <input id="inv-only-online" type="checkbox" />
+                <span>Hanya Online</span>
+              </label>
+            </div>
+          </div>
+          <div id="inv-rarity-filter" class="pill-wrap">
+            <button type="button" class="pill-toggle active" data-inv-rarity="ALL">Semua Rarity</button>
+            <button type="button" class="pill-toggle" data-inv-rarity="Mythical">Mythical</button>
+            <button type="button" class="pill-toggle" data-inv-rarity="Legendary">Legendary</button>
+            <button type="button" class="pill-toggle" data-inv-rarity="Rare">Rare</button>
+            <button type="button" class="pill-toggle" data-inv-rarity="Uncommon">Uncommon</button>
+            <button type="button" class="pill-toggle" data-inv-rarity="Common">Common</button>
+          </div>
+        </div>
+        <div id="inventory-grid" class="inventory-grid"></div>
       </section>
 
       <!-- TAB 2: REMOTE CONFIG -->

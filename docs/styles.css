@@ -682,3 +682,225 @@ body {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+
+/* ==========================================================================
+   v3.4 MULTI-ACCOUNT INVENTORY & LIVE UPTIME
+   ========================================================================== */
+.inst-badges {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.uptime-chip {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(0, 217, 245, 0.12);
+  border: 1px solid rgba(0, 217, 245, 0.28);
+  color: var(--cyan);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-inv-box {
+  background: rgba(7, 11, 18, 0.58);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 11px;
+  padding: 8px 10px;
+}
+.card-inv-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--cyan);
+  font-weight: 600;
+  cursor: pointer;
+}
+.link-btn:hover { text-decoration: underline; }
+
+.mini-fruit-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+.mini-fruit-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-radius: 8px;
+  background: rgba(17, 28, 45, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  font-size: 0.74rem;
+  --rc: var(--common);
+  border-left: 2.5px solid var(--rc);
+}
+.mini-fruit-pill.r-Mythical { --rc: var(--mythical); }
+.mini-fruit-pill.r-Legendary { --rc: var(--legendary); }
+.mini-fruit-pill.r-Rare { --rc: var(--rare); }
+.mini-fruit-pill.r-Uncommon { --rc: var(--uncommon); }
+.mini-fruit-pill.held {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.1);
+}
+.mini-fruit-pill img {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  border-radius: 4px;
+}
+.mini-fruit-pill strong {
+  color: var(--emerald);
+  font-size: 0.7rem;
+}
+.mini-fruit-pill.held strong { color: var(--amber); }
+.mini-fruit-more {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px dashed rgba(148, 163, 184, 0.3);
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+.mini-fruit-more:hover { color: var(--cyan); border-color: var(--cyan); }
+
+/* Tab: Inventory Akun */
+.inventory-toolbar {
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.inv-toolbar-top {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.inv-toolbar-top h2 { margin: 0 0 3px; font-size: 1.18rem; }
+.inv-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.inv-controls .search-input { width: 260px; max-width: 100%; }
+.inv-online-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.82rem;
+  cursor: pointer;
+  user-select: none;
+}
+.inv-online-toggle input { accent-color: var(--emerald); width: 15px; height: 15px; }
+
+.inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(355px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.inv-account-card {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.inv-account-card.online { border-color: rgba(0, 245, 160, 0.3); }
+.inv-account-card.offline { opacity: 0.76; }
+.inv-account-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(7, 11, 18, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  font-size: 0.8rem;
+}
+.inv-held-strip {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(251, 191, 36, 0.07);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+}
+.inv-fruit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 7px;
+  max-height: 330px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.inv-fruit-tile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  --rc: var(--common);
+  border-left: 3px solid var(--rc);
+  min-width: 0;
+}
+.inv-fruit-tile.r-Mythical { --rc: var(--mythical); }
+.inv-fruit-tile.r-Legendary { --rc: var(--legendary); }
+.inv-fruit-tile.r-Rare { --rc: var(--rare); }
+.inv-fruit-tile.r-Uncommon { --rc: var(--uncommon); }
+.inv-fruit-tile.held { border-color: rgba(251, 191, 36, 0.45); }
+.inv-fruit-tile img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+.inv-tile-info { min-width: 0; flex: 1; }
+.inv-tile-name {
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inv-count-badge {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 7px;
+  background: rgba(0, 245, 160, 0.16);
+  color: var(--emerald);
+  flex-shrink: 0;
+}
+.inv-count-badge.held {
+  background: rgba(251, 191, 36, 0.2);
+  color: var(--amber);
+}
+
+@media (max-width: 520px) {
+  .inventory-grid { grid-template-columns: 1fr; }
+  .inv-controls .search-input { width: 100%; }
+}

@@ -183,6 +183,9 @@ const state = {
   draftConfig: structuredClone(DEFAULT_CONFIG),
   configInitialized: false,
   altRouteTarget: null,
+  invRarityFilter: "ALL",
+  invOnlyOnline: false,
+  serverOffsetMs: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -246,6 +249,25 @@ function formatAge(msDiff) {
   if (m < 60) return `${m}m lalu`;
   const h = Math.floor(m / 60);
   return `${h}j lalu`;
+}
+
+function formatUptime(msDiff) {
+  const totalSec = Math.max(0, Math.floor(msDiff / 1000));
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  if (days > 0) return `${days}h ${pad(hours)}j ${pad(mins)}m`;
+  if (hours > 0) return `${hours}j ${pad(mins)}m ${pad(secs)}d`;
+  if (mins > 0) return `${mins}m ${pad(secs)}d`;
+  return `${secs}d`;
+}
+
+function getInstanceUptimeMs(inst, refServerMs) {
+  const start = Number(inst.startedAt || inst.lastSeen || refServerMs);
+  const end = inst.online ? refServerMs : Number(inst.lastSeen || refServerMs);
+  return Math.max(0, end - start);
 }
 
 async function apiFetch(path, options = {}) {
@@ -357,8 +379,14 @@ function renderAll(forceConfigSync) {
   const onlineList = instances.filter((x) => x.online);
   const flyingCount = onlineList.filter((x) => x.flightTarget).length;
   const totalStored = instances.reduce((acc, x) => acc + (x.storedSession || 0), 0);
+  const totalInvCount = instances.reduce(
+    (acc, x) => acc + Number(x.inventory?.totalStoredCount || 0) + Number((x.inventory?.held || []).length || 0),
+    0
+  );
+  state.serverOffsetMs = Number(d.serverTime || Date.now()) - Date.now();
 
   $("badge-online").textContent = String(onlineList.length);
+  if ($("badge-inv-total")) $("badge-inv-total").textContent = formatNumber(totalInvCount);
   $("kpi-online").textContent = `${onlineList.length} / ${instances.length}`;
   $("kpi-in-flight").textContent = `${flyingCount} sedang terbang`;
   setKpiNumber("kpi-stored", totalStored);
@@ -372,6 +400,7 @@ function renderAll(forceConfigSync) {
   if (updated) updated.textContent = `Update terakhir ${new Date().toLocaleTimeString("id-ID")}`;
 
   renderInstances(instances, d.serverTime);
+  renderInventoryMatrix(instances, d.serverTime);
   syncTargetSelector(instances);
   if (forceConfigSync || !state.configInitialized) {
     loadDraftConfigForTarget(state.configTarget);
@@ -419,6 +448,25 @@ function renderInstances(instances, serverTime) {
         : `<div class="tiny muted" style="padding: 4px 2px;">Tidak ada fruit di Workspace server ini.</div>`;
 
       const hasOverride = Object.keys(inst.overrideConfig || {}).length > 0;
+      const uptimeMs = getInstanceUptimeMs(inst, serverTime);
+      const uptimeText = formatUptime(uptimeMs);
+      const startedAt = Number(inst.startedAt || 0);
+      const inv = inst.inventory || {};
+      const storedList = Array.isArray(inv.stored) ? inv.stored : [];
+      const heldList = Array.isArray(inv.held) ? inv.held : [];
+      const storedTotal = Number(inv.totalStoredCount ?? storedList.reduce((acc, f) => acc + Number(f.count || 1), 0));
+      const storedTop = storedList.slice(0, 6).map((f) => {
+        const rarity = String(f.rarity || "Unknown");
+        const cnt = Number(f.count || 1);
+        return `<span class="mini-fruit-pill r-${escapeHtml(rarity)}" title="${escapeHtml(f.display || f.id)} (${escapeHtml(rarity)})"><img src="${escapeHtml(f.icon || DEFAULT_ICON)}" alt="" loading="lazy" onerror="this.src='${DEFAULT_ICON}'" /><span>${escapeHtml(f.display || f.id)}</span>${cnt > 1 ? `<strong>×${cnt}</strong>` : ""}</span>`;
+      }).join("");
+      const heldTop = heldList.slice(0, 4).map((h) => {
+        const rarity = String(h.rarity || "Unknown");
+        return `<span class="mini-fruit-pill held r-${escapeHtml(rarity)}" title="${escapeHtml(h.display || h.id)} (Backpack)"><img src="${escapeHtml(h.icon || DEFAULT_ICON)}" alt="" loading="lazy" onerror="this.src='${DEFAULT_ICON}'" /><span>🖐 ${escapeHtml(h.display || h.id)}</span><strong>BP</strong></span>`;
+      }).join("");
+      const invPreviewHtml = (storedTop || heldTop)
+        ? `<div class="mini-fruit-grid">${heldTop}${storedTop}${storedList.length > 6 ? `<button type="button" class="mini-fruit-more" data-act="open-inv" data-key="${escapeHtml(inst.instanceKey)}">+${storedList.length - 6}</button>` : ""}</div>`
+        : `<div class="tiny muted">Inventory belum tersinkron.</div>`;
 
       const initial = escapeHtml((inst.playerName || "?").trim().charAt(0).toUpperCase() || "?");
       const flying = inst.online && inst.flightTarget;
@@ -432,7 +480,10 @@ function renderInstances(instances, serverTime) {
               <div class="tiny muted">Lv.${formatNumber(inst.level)} • $${formatNumber(inst.beli)} Beli • Fruit: ${escapeHtml(inst.equippedFruit || "None")}</div>
             </div>
           </div>
-          <span class="status-pill ${inst.online ? "online" : "offline"}">${inst.online ? "ONLINE" : "OFFLINE"} • ${age}</span>
+          <div class="inst-badges">
+            <span class="status-pill ${inst.online ? "online" : "offline"}">${inst.online ? "ONLINE" : "OFFLINE"} • ${age}</span>
+            <span class="uptime-chip ${inst.online ? "live" : ""}" data-uptime-started="${Number(startedAt || inst.lastSeen || serverTime)}" data-uptime-last="${Number(inst.lastSeen || serverTime)}" data-uptime-online="${inst.online ? "1" : "0"}" title="Lama berjalan akun">⏱️ ${escapeHtml(uptimeText)}</span>
+          </div>
         </div>
 
         <div class="inst-live-box">
@@ -445,8 +496,16 @@ function renderInstances(instances, serverTime) {
         <div class="inst-stats">
           <div class="stat-mini"><span class="muted">Stored</span><strong>${inst.storedSession}</strong></div>
           <div class="stat-mini"><span class="muted">Pool</span><strong>${inst.poolCount}</strong></div>
-          <div class="stat-mini"><span class="muted">DB Mesh</span><strong>${inst.learnedCount}</strong></div>
+          <div class="stat-mini"><span class="muted">Inv</span><strong>${storedTotal}</strong></div>
           <div class="stat-mini"><span class="muted">Turbo</span><strong>${inst.turboMode ? "ON" : "OFF"}</strong></div>
+        </div>
+
+        <div class="card-inv-box">
+          <div class="card-inv-head">
+            <span class="tiny muted">Inventory (${storedTotal} stored${heldList.length ? `, ${heldList.length} held` : ""})</span>
+            <button type="button" class="link-btn tiny" data-act="open-inv" data-key="${escapeHtml(inst.instanceKey)}">Lihat semua →</button>
+          </div>
+          ${invPreviewHtml}
         </div>
 
         <div class="fruit-strip">${fruitRows}</div>
@@ -461,6 +520,120 @@ function renderInstances(instances, serverTime) {
           <button class="btn btn-xs btn-danger-ghost" data-act="cmd" data-key="${escapeHtml(inst.instanceKey)}" data-cmd="remote_stop">🛑 Stop</button>
           ${!inst.online ? `<button class="btn btn-xs btn-danger-ghost" data-act="delete" data-key="${escapeHtml(inst.instanceKey)}">🗑️</button>` : ""}
         </div>
+      </article>`;
+    })
+    .join("");
+}
+
+function renderInventoryMatrix(instances, serverTime) {
+  const grid = $("inventory-grid");
+  if (!grid) return;
+
+  const query = ($("inv-search")?.value || "").trim().toLowerCase();
+  const rarityFilter = state.invRarityFilter || "ALL";
+  const onlyOnline = state.invOnlyOnline === true;
+  const visible = onlyOnline ? instances.filter((x) => x.online) : instances;
+
+  let grandTotalCount = 0;
+  let grandTotalValue = 0;
+  for (const inst of visible) {
+    grandTotalCount += Number(inst.inventory?.totalStoredCount || 0) + Number((inst.inventory?.held || []).length || 0);
+    grandTotalValue += Number(inst.inventory?.totalValue || 0);
+  }
+  if ($("inv-summary-line")) {
+    $("inv-summary-line").textContent = `${formatNumber(grandTotalCount)} fruit tersimpan • Estimasi $${formatNumber(grandTotalValue)} Beli • ${visible.length} akun`;
+  }
+
+  if (!visible.length) {
+    grid.innerHTML = `
+      <div class="empty-state glass">
+        <div class="empty-orb">🎒</div>
+        <h3>Tidak Ada Akun Ditampilkan</h3>
+        <p class="muted small">Jalankan bot atau matikan filter "Hanya Online" untuk melihat semua inventory akun.</p>
+      </div>`;
+    return;
+  }
+
+  const matchesItem = (item) => {
+    if (rarityFilter !== "ALL" && (item.rarity || "Unknown") !== rarityFilter) return false;
+    if (!query) return true;
+    return (
+      String(item.display || "").toLowerCase().includes(query) ||
+      String(item.id || "").toLowerCase().includes(query) ||
+      String(item.rarity || "").toLowerCase().includes(query)
+    );
+  };
+
+  grid.innerHTML = visible
+    .map((inst) => {
+      const inv = inst.inventory || {};
+      const stored = (Array.isArray(inv.stored) ? inv.stored : []).filter(matchesItem);
+      const held = (Array.isArray(inv.held) ? inv.held : []).filter(matchesItem);
+      const initial = escapeHtml((inst.playerName || "?").trim().charAt(0).toUpperCase() || "?");
+      const uptimeMs = getInstanceUptimeMs(inst, serverTime);
+
+      const heldHtml = held.length
+        ? `<div class="inv-held-strip">
+             <div class="tiny amber" style="font-weight:700; margin-bottom:6px;">🖐️ Di Backpack / Tangan (${held.length})</div>
+             <div class="inv-fruit-grid">
+               ${held
+                 .map(
+                   (f) => `
+                   <div class="inv-fruit-tile r-${escapeHtml(f.rarity || "Unknown")} held">
+                     <img src="${escapeHtml(f.icon || DEFAULT_ICON)}" alt="" loading="lazy" onerror="this.src='${DEFAULT_ICON}'" />
+                     <div class="inv-tile-info">
+                       <div class="inv-tile-name">${escapeHtml(f.display || f.id)}</div>
+                       <div class="tiny muted">${escapeHtml(f.rarity || "Unknown")}</div>
+                     </div>
+                     <span class="inv-count-badge held">BP</span>
+                   </div>`
+                 )
+                 .join("")}
+             </div>
+           </div>`
+        : "";
+
+      const storedHtml = stored.length
+        ? `<div class="inv-fruit-grid">
+             ${stored
+               .map(
+                 (f) => `
+                 <div class="inv-fruit-tile r-${escapeHtml(f.rarity || "Unknown")}">
+                   <img src="${escapeHtml(f.icon || DEFAULT_ICON)}" alt="" loading="lazy" onerror="this.src='${DEFAULT_ICON}'" />
+                   <div class="inv-tile-info">
+                     <div class="inv-tile-name">${escapeHtml(f.display || f.id)}</div>
+                     <div class="tiny muted">${escapeHtml(f.rarity || "Unknown")}</div>
+                   </div>
+                   <span class="inv-count-badge">x${Number(f.count || 1)}</span>
+                 </div>`
+               )
+               .join("")}
+           </div>`
+        : `<div class="muted small" style="padding: 10px 4px;">${query || rarityFilter !== "ALL" ? "Tidak ada fruit cocok dengan filter." : "Inventory tersimpan kosong / belum tersinkron."}</div>`;
+
+      return `
+      <article class="inv-account-card glass ${inst.online ? "online" : "offline"}">
+        <div class="inst-top">
+          <div class="inst-id">
+            <div class="avatar">${initial}<span class="avatar-dot"></span></div>
+            <div>
+              <div class="inst-name">${escapeHtml(inst.playerName)}</div>
+              <div class="tiny muted">Lv.${formatNumber(inst.level)} • $${formatNumber(inst.beli)} Beli • Pakai: ${escapeHtml(inst.equippedFruit || "None")}</div>
+            </div>
+          </div>
+          <div class="inst-badges">
+            <span class="status-pill ${inst.online ? "online" : "offline"}">${inst.online ? "ONLINE" : "OFFLINE"}</span>
+            <span class="uptime-chip" data-uptime-started="${Number(inst.startedAt || inst.lastSeen || serverTime)}" data-uptime-last="${Number(inst.lastSeen || serverTime)}" data-uptime-online="${inst.online ? "1" : "0"}">⏱️ ${formatUptime(uptimeMs)}</span>
+          </div>
+        </div>
+
+        <div class="inv-account-meta">
+          <span>📦 Stored: <strong>${formatNumber(inv.totalStoredCount || 0)}</strong> (${formatNumber(inv.totalUnique || 0)} jenis)</span>
+          <span>💎 Value: <strong class="emerald">$${formatNumber(inv.totalValue || 0)}</strong></span>
+        </div>
+
+        ${heldHtml}
+        ${storedHtml}
       </article>`;
     })
     .join("");
@@ -776,6 +949,8 @@ $("instances-grid").addEventListener("click", async (e) => {
       $("cfg-target-select").value = key;
       loadDraftConfigForTarget(key);
       document.querySelector('[data-tab="config"]').click();
+    } else if (act === "open-inv") {
+      document.querySelector('[data-tab="inventory"]').click();
     } else if (act === "delete") {
       await apiFetch(`/api/instance/${encodeURIComponent(key)}`, { method: "DELETE" });
       toast("Kartu instance offline dihapus.");
@@ -893,6 +1068,42 @@ $("btn-clear-history").addEventListener("click", async () => {
 });
 
 $("fp-search").addEventListener("input", () => renderIntel(state.dashboard));
+
+if ($("inv-search")) {
+  $("inv-search").addEventListener("input", () => {
+    if (state.dashboard) renderInventoryMatrix(state.dashboard.instances || [], state.dashboard.serverTime || Date.now());
+  });
+}
+if ($("inv-only-online")) {
+  $("inv-only-online").addEventListener("change", (e) => {
+    state.invOnlyOnline = e.target.checked;
+    if (state.dashboard) renderInventoryMatrix(state.dashboard.instances || [], state.dashboard.serverTime || Date.now());
+  });
+}
+if ($("inv-rarity-filter")) {
+  $("inv-rarity-filter").addEventListener("click", (e) => {
+    const pill = e.target.closest("[data-inv-rarity]");
+    if (!pill) return;
+    state.invRarityFilter = pill.dataset.invRarity;
+    document.querySelectorAll("[data-inv-rarity]").forEach((p) => {
+      p.classList.toggle("active", p.dataset.invRarity === state.invRarityFilter);
+    });
+    if (state.dashboard) renderInventoryMatrix(state.dashboard.instances || [], state.dashboard.serverTime || Date.now());
+  });
+}
+
+// 1-second live uptime ticker for all online instance cards & inventory headers
+setInterval(() => {
+  if ($("app-shell")?.classList.contains("hidden")) return;
+  const nowServerMs = Date.now() + (state.serverOffsetMs || 0);
+  document.querySelectorAll("[data-uptime-started]").forEach((el) => {
+    if (el.dataset.uptimeOnline !== "1") return;
+    const started = Number(el.dataset.uptimeStarted || 0);
+    if (started > 0) {
+      el.textContent = `⏱️ ${formatUptime(nowServerMs - started)}`;
+    }
+  });
+}, 1000);
 $("fp-list").addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-del-fp]");
   if (!btn) return;

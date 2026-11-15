@@ -199,9 +199,40 @@ local VISITED_FILE       = "AegisFruitSniper/visited_servers.json"
 local POOL_FILE          = "AegisFruitSniper/server_pool.json"
 local FINGERPRINTS_FILE  = "AegisFruitSniper/fruit_fingerprints_v2.json"
 local SCRIPT_FILE        = "AegisFruitSniper/GreatestFruitSniper.luau"
+local SESSION_FILE       = "AegisFruitSniper/session_" .. tostring(LocalPlayer.UserId) .. ".json"
 local IsInitializingUI   = true
 local LastConfigSave     = 0
 local ScriptStartTime    = os.clock()
+local SessionStartedAt   = os.time()
+local CachedStoredFruits = {}
+local LastInventoryFetchAt = 0
+local InventoryNeedsRefresh = true
+
+local function saveSessionState()
+    pcall(function()
+        if writefile then
+            if isfolder and makefolder and not isfolder(CONFIG_FOLDER) then
+                makefolder(CONFIG_FOLDER)
+            end
+            writefile(SESSION_FILE, HttpService:JSONEncode({
+                startedAt = SessionStartedAt,
+                lastActiveAt = os.time(),
+            }))
+        end
+    end)
+end
+
+pcall(function()
+    if isfile and readfile and isfile(SESSION_FILE) then
+        local dec = HttpService:JSONDecode(readfile(SESSION_FILE))
+        if type(dec) == "table" and tonumber(dec.startedAt) and tonumber(dec.lastActiveAt) then
+            if (os.time() - tonumber(dec.lastActiveAt)) <= 180 and tonumber(dec.startedAt) > 0 then
+                SessionStartedAt = tonumber(dec.startedAt)
+            end
+        end
+    end
+end)
+saveSessionState()
 
 local function ensureConfigFolder()
     pcall(function()
@@ -1595,6 +1626,7 @@ local function storeSingleFruitTool(tool)
             if ok and res == true then
                 StoredToolCache[tool] = "STORED"
                 TotalSnipedSession = TotalSnipedSession + 1
+                InventoryNeedsRefresh = true
                 table.insert(WebHub.PendingCatches, {
                     catchUid = string.format("%s:%s:%d:%d", tostring(LocalPlayer.UserId), origName, os.time(), TotalSnipedSession),
                     fruitId = origName,
@@ -1964,6 +1996,7 @@ local function hopToNewServer()
     stopFlight()
     clearAllEsp()
     VisitedServers[tostring(game.JobId)] = os.time()
+    saveSessionState()
     saveConfig(true)
     saveServerHopCache()
     armTeleportAutoExecute()
@@ -3202,6 +3235,83 @@ function WebHub.claimServer(jobId, oldJobId)
     return true
 end
 
+local function refreshStoredInventorySnapshot(force)
+    local nowClock = os.clock()
+    if not force and not InventoryNeedsRefresh and (nowClock - LastInventoryFetchAt) < 20 then
+        return CachedStoredFruits
+    end
+    local commF = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+    if not commF then return CachedStoredFruits end
+
+    local ok, inv = pcall(function()
+        return commF:InvokeServer("getInventory")
+    end)
+    if ok and type(inv) == "table" then
+        local list = {}
+        for _, item in pairs(inv) do
+            if type(item) == "table" and (item.Type == "Blox Fruit" or (type(item.Name) == "string" and FruitMetaById[item.Name] ~= nil)) then
+                local rawName = tostring(item.Name or "")
+                local cleanLower = rawName:gsub(" Fruit$", ""):lower()
+                local itemIdNum = tonumber(item.ItemId)
+                local meta = FruitMetaById[rawName] or (itemIdNum and FruitMetaByItemId[itemIdNum]) or FruitMetaByShort[cleanLower]
+                local cnt = math.max(1, math.floor(tonumber(item.Count) or 1))
+                table.insert(list, {
+                    id = meta and meta.Id or rawName,
+                    display = meta and meta.Display or rawName,
+                    rarity = meta and meta.Rarity or "Unknown",
+                    price = meta and meta.Price or tonumber(item.Value) or 0,
+                    count = cnt,
+                    icon = (meta and meta.Icon) or DEFAULT_FRUIT_ICON,
+                })
+            end
+        end
+        table.sort(list, function(a, b)
+            if (a.price or 0) ~= (b.price or 0) then
+                return (a.price or 0) > (b.price or 0)
+            end
+            return tostring(a.display) < tostring(b.display)
+        end)
+        CachedStoredFruits = list
+        LastInventoryFetchAt = nowClock
+        InventoryNeedsRefresh = false
+    end
+    return CachedStoredFruits
+end
+
+local function collectHeldBackpackFruits()
+    local held = {}
+    local function scanContainer(container)
+        if not container then return end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and (tool.Name:find("Fruit") or tool:FindFirstChild("EatRemote") or tool:GetAttribute("OriginalName") or tool:GetAttribute("ItemId")) then
+                local orig = tool:GetAttribute("OriginalName")
+                local itemId = tonumber(tool:GetAttribute("ItemId"))
+                local clean = tool.Name:gsub(" Fruit$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                local meta = (type(orig) == "string" and FruitMetaById[orig])
+                    or (itemId and FruitMetaByItemId[itemId])
+                    or FruitMetaById[clean .. "-" .. clean]
+                    or FruitMetaByShort[clean:lower()]
+                local isPhysicalFruit = (meta ~= nil and tool.ToolTip ~= "Blox Fruit")
+                    or tool.Name:find("Fruit") ~= nil
+                    or tool:FindFirstChild("EatRemote") ~= nil
+                if isPhysicalFruit then
+                    table.insert(held, {
+                        id = meta and meta.Id or (orig or clean),
+                        display = meta and meta.Display or clean,
+                        rarity = meta and meta.Rarity or "Unknown",
+                        price = meta and meta.Price or 0,
+                        count = 1,
+                        icon = (meta and meta.Icon) or DEFAULT_FRUIT_ICON,
+                    })
+                end
+            end
+        end
+    end
+    scanContainer(LocalPlayer:FindFirstChild("Backpack"))
+    scanContainer(LocalPlayer.Character)
+    return held
+end
+
 function WebHub.syncNow(force, liveStatusText)
     if WebHub.IsSyncing or not httpRequestFn then return end
     local key = WebHub.getKey()
@@ -3272,6 +3382,17 @@ function WebHub.syncNow(force, liveStatusText)
                 table.insert(uploadCatches, c)
             end
 
+            saveSessionState()
+            local storedFruits = refreshStoredInventorySnapshot(false)
+            local heldFruits = collectHeldBackpackFruits()
+            local totalStoredCount = 0
+            local totalStoredValue = 0
+            for _, sf in ipairs(storedFruits) do
+                local c = tonumber(sf.count) or 1
+                totalStoredCount = totalStoredCount + c
+                totalStoredValue = totalStoredValue + ((tonumber(sf.price) or 0) * c)
+            end
+
             local payload = {
                 instanceKey = tostring(LocalPlayer.UserId),
                 userId = tostring(LocalPlayer.UserId),
@@ -3288,6 +3409,15 @@ function WebHub.syncNow(force, liveStatusText)
                 flightTarget = FlightState.Active and tostring(FlightState.TargetLabel or "") or "",
                 mapFruits = mapFruitsSummary,
                 dealerStock = dealerSummary,
+                inventory = {
+                    stored = storedFruits,
+                    held = heldFruits,
+                    totalStoredCount = totalStoredCount,
+                    totalUnique = #storedFruits,
+                    totalValue = totalStoredValue,
+                    updatedAt = os.time() * 1000,
+                },
+                startedAt = SessionStartedAt * 1000,
                 storedSession = TotalSnipedSession,
                 poolCount = #CachedServerPool,
                 learnedCount = LearnedFruitCount,
